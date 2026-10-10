@@ -164,18 +164,16 @@ def test_compare_dcf_models(client):
 
 
 def test_compare_dcf_models_handle_ddm_error(client):
-    # If the first call with fcf, eps, ddm raises ValueError with "dividende",
+    # If the first call with fcf, eps, ddm raises ValueError with "dividend",
     # the router should try again with only fcf, eps.
-    side_effects = [ValueError("Pas de dividende"), MOCK_DCF_RESULT]
+    side_effects = [ValueError("No dividend paid"), MOCK_DCF_RESULT]
     app.state.dcf_service.compute_dcf.side_effect = side_effects
 
     response = client.get("/dcf/AAPL/compare")
     assert response.status_code == 200
     data = response.json()
     assert data["ticker"] == "AAPL"
-    assert (
-        data["models"]["ddm"]["warnings"][0] == "Modèle DDM impossible : aucun dividende distribué."
-    )
+    assert data["models"]["ddm"]["warnings"][0] == "DDM not applicable: no dividend paid."
 
 
 def test_get_dcf_sensitivity_success(client):
@@ -224,3 +222,30 @@ def test_refresh_ticker_news(client):
     response = client.post("/news/AAPL/refresh")
     assert response.status_code == 200
     assert response.json() == {"status": "queued", "ticker": "AAPL"}
+
+
+def test_dcf_across_currencies_answers_its_currencies_and_no_upside(client):
+    """Euro statements, a price in dollars: the answer says so instead of a wrong upside."""
+    warning = (
+        "The share price is quoted in USD and the statements are in EUR: no upside is computed."
+    )
+    app.state.dcf_service.compute_dcf.return_value = MOCK_DCF_RESULT.model_copy(
+        update={
+            "currency": "EUR",
+            "price_currency": "USD",
+            "consensus_upside_pct": None,
+            "warnings": [warning],
+            "models": {"fcf": MOCK_MODEL_RESULT.model_copy(update={"upside_pct": None})},
+            "wacc": MOCK_WACC.model_copy(
+                update={"risk_free_rate_source": "ecb_live", "risk_free_rate_currency": "EUR"}
+            ),
+        }
+    )
+
+    data = client.get("/dcf/ACME?force_refresh=true").json()
+
+    assert (data["currency"], data["price_currency"]) == ("EUR", "USD")
+    assert data["consensus_upside_pct"] is None
+    assert data["models"]["fcf"]["upside_pct"] is None
+    assert data["warnings"] == [warning]
+    assert data["wacc"]["risk_free_rate_currency"] == "EUR"

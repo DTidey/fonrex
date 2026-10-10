@@ -321,10 +321,10 @@ class GetFundamentals:
             # over under other names, every stored figure was left out of the answer.
             final_response = self.formatter.to_eodhd({**results, **deep_sections})
         else:
-            # Format brut (par défaut ou si spécifié)
+            # Raw format (default, or when asked)
             final_response = results
 
-        # Mise en cache Redis si activé (TTL 1h)
+        # Redis cache when enabled (TTL 1h)
         if redis_client and not nocache:
             await redis_client.setex(cache_key, 3600, json.dumps(final_response, default=str))
 
@@ -398,8 +398,8 @@ class GetDeepFundamentals:
         if not ticker and not isin:
             raise InvalidInput(
                 {
-                    "error": "Paramètre manquant",
-                    "message": "Le paramètre ticker ou isin est requis",
+                    "error": "Missing parameter",
+                    "message": "The ticker or isin parameter is required",
                     "examples": {
                         "ticker": "/fundamental/deep?ticker=AIR.PA",
                         "isin": "/fundamental/deep?isin=NL0000235190",
@@ -410,7 +410,7 @@ class GetDeepFundamentals:
         requested_sections = set(s.strip().lower() for s in sections.split(",") if s.strip())
         want_all = "all" in requested_sections or not requested_sections
 
-        # 1. Résoudre l'actif
+        # 1. Resolve the asset
         asset_profile = None
         asset_id = None
         resolved_ticker = ticker
@@ -423,13 +423,15 @@ class GetDeepFundamentals:
                 resolved_ticker = asset_profile.get("ticker") or ticker
 
         if not asset_id:
-            raise ResourceNotFound(f"Actif introuvable pour ticker={ticker}, isin={isin}")
+            raise ResourceNotFound(f"Asset not found for ticker={ticker}, isin={isin}")
 
-        # 2. Vérifier le cache Redis. The entry holds every section: the request
+        # 2. Redis cache. The entry holds every section: the request
         # receives the ones it asked for. Cached as asked, an answer limited to
         # some sections was served to the requests for the others.
         cache_hit = False
-        cache_key_prefix = f"deep:{resolved_ticker}"
+        # Keyed by instrument: a ticker is not an identity (AIR is AAR Corp in New
+        # York and Airbus in Paris), and both answers were stored under deep:AIR.
+        cache_key_prefix = f"deep:{asset_id}"
 
         if cache_service and cache_service.enabled and not refresh:
             cached = await run_sync(cache_service.get, cache_key_prefix)
@@ -438,7 +440,7 @@ class GetDeepFundamentals:
                 cached["meta"] = {**cached.get("meta", {}), "source": "yfinance", "cache_hit": True}
                 return _requested_sections(cached, requested_sections, want_all)
 
-        # 3. Si cache miss ou refresh → appeler YFinanceEnricher, with the Yahoo
+        # 3. Cache miss or refresh → run YFinanceEnricher, with the Yahoo
         # symbol verified for the listing: the ticker of the catalogue may be the
         # symbol of another instrument, whose figures would be stored under this one.
         yahoo_symbol, yahoo_refusal = None, None
@@ -448,11 +450,11 @@ class GetDeepFundamentals:
             )
             if yahoo_symbol:
                 enrich_result = await self.enricher.enrich(asset_id, yahoo_symbol)
-                logger.info("Enrichissement deep pour %s: %s", yahoo_symbol, enrich_result)
+                logger.info("Deep enrichment of %s: %s", yahoo_symbol, enrich_result)
             else:
                 logger.warning("Deep fundamentals not refreshed: %s", yahoo_refusal)
 
-        # 4. Lire les données depuis PostgreSQL
+        # 4. Read the data from PostgreSQL
         response = {}
 
         if asset_profile:
@@ -466,7 +468,7 @@ class GetDeepFundamentals:
 
         response.update(await run_sync(db_service.get_deep_sections, asset_id, set(), True))
 
-        # 5. Métadonnées
+        # 5. Metadata
         response["meta"] = {
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "source": "yfinance",
@@ -480,7 +482,7 @@ class GetDeepFundamentals:
             response["meta"]["source"] = "database"
             response["meta"]["note"] = yahoo_refusal
 
-        # 6. Mettre en cache Redis
+        # 6. Cache it in Redis
         if cache_service and cache_service.enabled and not yahoo_refusal:
             await run_sync(
                 cache_service.set,

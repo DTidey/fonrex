@@ -378,13 +378,13 @@ class FundamentalsHighlights(Base):
     revenue_ttm = Column(Numeric(20, 2))
     ebitda_ttm = Column(Numeric(20, 2))
 
-    # Solvabilité (Phase 13)
+    # Solvency (Phase 13)
     debt_to_equity_ratio = Column(Numeric(10, 4))
     debt_to_assets_ratio = Column(Numeric(10, 6))
     net_debt_to_ebitda = Column(Numeric(10, 4))
     interest_coverage_ratio = Column(Numeric(10, 4))
 
-    # Coût de la dette (Phase 13)
+    # Cost of debt (Phase 13)
     actual_cost_of_debt = Column(Numeric(8, 6))
     cost_of_debt_source = Column(String(20))  # "calculated"|"sector_estimate"
 
@@ -411,7 +411,8 @@ class FinancialStatement(Base):
     period_type = Column(String(10), nullable=False)  # "annual" | "quarterly"
     period_end = Column(Date, nullable=False)
     fetched_at = Column(DateTime(timezone=True), server_default=func.now())
-    currency = Column(String(3), default="USD")
+    # Currency of the figures (Yahoo's financialCurrency); NULL when unknown.
+    currency = Column(String(3))
 
     # Income statement
     revenue = Column(Numeric(20, 2))
@@ -869,7 +870,7 @@ class ProviderAlert(Base):
 
 
 class MacroRateCache(Base):
-    """Cache local des séries de taux FRED, rafraîchi périodiquement."""
+    """Local cache of the rate series (FRED, ECB), refreshed periodically."""
     __tablename__ = "macro_rates_cache"
     __table_args__ = (
         UniqueConstraint("series_id", "observation_date",
@@ -877,7 +878,9 @@ class MacroRateCache(Base):
         Index("ix_macro_rates_series_date", "series_id", "observation_date"),
     )
     id               = Column(Integer, primary_key=True, autoincrement=True)
-    series_id        = Column(String(30), nullable=False)
+    # "DGS10" for FRED, "YC.B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y" (flow.key) for the ECB.
+    series_id        = Column(String(60), nullable=False)
+    source           = Column(String(10))  # "fred" | "ecb"
     label            = Column(String(100))
     value            = Column(Numeric(10, 6), nullable=False)
     unit             = Column(String(10))

@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-NewsService — Agrège les news depuis plusieurs providers.
+NewsService — gathers news from several providers.
 
-Design :
-- Appels async en parallèle sur tous les providers disponibles
-- Déduplication par URL (clé unique) puis par titre similaire
-- Persistance dans news_articles (PostgreSQL)
-- Cache Redis 30min par (ticker, limit)
-- Fallback gracieux : si un provider échoue, les autres continuent
+Design:
+- Every available provider is called at once (async)
+- Deduplication by URL (unique key), then by similar title
+- Stored in news_articles (PostgreSQL)
+- Redis cache of 30 minutes per (ticker, limit)
+- Graceful fallback: when a provider fails, the others carry on
 """
 
 import asyncio
@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from database.ticker_suffix import listing_on, ticker_lookups
 from models import Asset, AssetListing, AssetMapping, NewsArticle
 from news.providers.boursorama_news import BoursoramaNewsProvider
 from news.providers.google_finance_news import GoogleFinanceNewsProvider
@@ -56,7 +57,7 @@ _UTM_PARAMS = {
 
 
 class NewsService:
-    """Orchestrateur d'agrégation de news financières."""
+    """Gathers financial news."""
 
     PROVIDERS = [
         YFinanceNewsProvider,
@@ -86,7 +87,7 @@ class NewsService:
             raise RuntimeError("NewsService database session is not configured")
         yield self.db
 
-    # ── Point d'entrée principal ─────────────────────────────────────────────
+    # ── Main entry point ─────────────────────────────────────────────────────
 
     async def get_news(
         self,
@@ -97,7 +98,7 @@ class NewsService:
         asset_id: Optional[int] = None,
     ) -> NewsResponse:
         """
-        Retourne les news d'un ticker depuis tous les providers.
+        The news of a ticker from every provider.
         """
         if language and language.lower() == "all":
             language = None
@@ -110,7 +111,7 @@ class NewsService:
             if cached:
                 return NewsResponse(**{**cached, "cached": True})
 
-        # 2. Résoudre l'asset
+        # 2. Resolve the asset
         asset = await self._resolve_asset(ticker)
         if asset:
             asset_id = asset_id or asset.id
@@ -123,21 +124,21 @@ class NewsService:
         if asset_id:
             mappings = await self._get_provider_mappings(asset_id)
 
-        # 4. Lancer tous les providers en parallèle
+        # 4. Call every provider at once
         raw_items = await self._fetch_from_all_providers(ticker, mappings, limit * 2)
 
-        # 5. Filtrer par langue si demandé
+        # 5. Filter by language when asked
         if language:
             raw_items = [i for i in raw_items if not i.language or i.language == language]
 
-        # 6. Dédupliquer
+        # 6. Deduplicate
         deduped = self._deduplicate(raw_items)[:limit]
 
-        # 7. Persister
+        # 7. Store
         if asset_id:
             await self._upsert_articles(deduped, asset_id, ticker)
 
-        # 8. Construire la réponse
+        # 8. Build the answer
         providers_used = list({i.provider for i in deduped})
         articles = [
             NewsArticleSchema(
@@ -164,7 +165,7 @@ class NewsService:
             articles=articles,
         )
 
-        # 9. Mettre en cache
+        # 9. Cache it
         await self._set_cache(cache_key, response.model_dump())
 
         return response
@@ -177,7 +178,7 @@ class NewsService:
         ticker_filter: Optional[List[str]] = None,
     ) -> NewsFeedResponse:
         """
-        Retourne un feed global des dernières news depuis news_articles en base.
+        A global feed of the latest news stored in news_articles.
         """
         if language and language.lower() == "all":
             language = None
@@ -191,7 +192,7 @@ class NewsService:
             query = query.where(NewsArticle.published_at >= from_date)
 
         if ticker_filter:
-            # Filtre sur related_tickers (ARRAY @> ARRAY)
+            # Filter on related_tickers (ARRAY @> ARRAY)
             query = query.where(
                 NewsArticle.related_tickers.overlap(ticker_filter)  # type: ignore[attr-defined]
             )
@@ -226,7 +227,7 @@ class NewsService:
         limit: int,
     ) -> List[RawNewsItem]:
         """
-        Lance tous les providers en parallèle via asyncio.gather.
+        Call every provider at once with asyncio.gather.
         """
         tasks = []
         for provider in self._providers:
@@ -253,14 +254,14 @@ class NewsService:
         return all_items
 
     async def _safe_fetch(self, provider, **kwargs) -> List[RawNewsItem]:
-        """Wrapper qui garantit qu'un provider ne propage jamais d'exception."""
+        """Wrapper making sure a provider never raises."""
         try:
             return await provider.fetch(**kwargs) or []
         except Exception as exc:
-            logger.warning("[NewsService] Provider %s échoué: %s", provider.name, exc)
+            logger.warning("[NewsService] Provider %s failed: %s", provider.name, exc)
             return []
 
-    # ── Déduplication ────────────────────────────────────────────────────────
+    # ── Deduplication ────────────────────────────────────────────────────────
 
     @staticmethod
     def _to_utc(dt: Optional[datetime]) -> datetime:
@@ -273,11 +274,11 @@ class NewsService:
 
     def _deduplicate(self, items: List[RawNewsItem]) -> List[RawNewsItem]:
         """
-        Étape 1 : déduplication stricte par URL normalisée.
-        Étape 2 : déduplication par titre similaire (> 85%).
-        Tri final par published_at DESC (nulls en dernier).
+        Step 1: strict deduplication by normalised URL.
+        Step 2: deduplication by similar title (> 85%).
+        Sorted by published_at DESC (nulls last).
         """
-        # Étape 1 — URL
+        # Step 1 — URL
         seen_urls: dict = {}
         for item in items:
             norm = self._normalize_url(item.url)
@@ -286,7 +287,7 @@ class NewsService:
 
         deduped = list(seen_urls.values())
 
-        # Étape 2 — titres similaires
+        # Step 2 — similar titles
         threshold = float(__import__("os").environ.get("NEWS_DEDUP_SIMILARITY", 0.85))
         final: List[RawNewsItem] = []
         for item in deduped:
@@ -296,7 +297,7 @@ class NewsService:
                 existing_norm = re.sub(r"[^\w\s]", "", existing.title.lower())
                 ratio = difflib.SequenceMatcher(None, normalized_title, existing_norm).ratio()
                 if ratio >= threshold:
-                    # Garder le plus récent (comparaison normalisée UTC)
+                    # Keep the latest (compared in UTC)
                     if self._to_utc(item.published_at) > self._to_utc(existing.published_at):
                         final[i] = item
                     is_dup = True
@@ -304,7 +305,7 @@ class NewsService:
             if not is_dup:
                 final.append(item)
 
-        # Tri par published_at DESC, nulls en dernier
+        # Sort by published_at DESC, nulls last
         final.sort(
             key=lambda x: self._to_utc(x.published_at),
             reverse=True,
@@ -313,11 +314,11 @@ class NewsService:
 
     def _normalize_url(self, url: str) -> str:
         """
-        Normalise une URL :
+        Normalise a URL:
         - Lowercase
-        - Supprime les paramètres UTM et tracking
-        - Supprime les fragments
-        - Retire le trailing slash
+        - Remove UTM and tracking parameters
+        - Remove fragments
+        - Remove the trailing slash
         """
         try:
             parsed = urlparse(url.lower())
@@ -338,7 +339,7 @@ class NewsService:
         except Exception:
             return url.lower().rstrip("/")
 
-    # ── Persistance ──────────────────────────────────────────────────────────
+    # ── Storage ──────────────────────────────────────────────────────────────
 
     async def _upsert_articles(
         self,
@@ -347,9 +348,9 @@ class NewsService:
         ticker: str,
     ) -> int:
         """
-        Upsert des articles dans news_articles.
-        ON CONFLICT (url) → met à jour title, summary, published_at.
-        Traite par batch de 50.
+        Upsert articles into news_articles.
+        ON CONFLICT (url) → updates title, summary, published_at.
+        Batches of 50.
         """
         if not items:
             return 0
@@ -411,7 +412,7 @@ class NewsService:
             raw = await self.redis.get(key)
             return json.loads(raw) if raw else None
         except Exception as e:
-            logger.warning("[NewsCache] Lecture échouée: %s", e)
+            logger.warning("[NewsCache] Read failed: %s", e)
             return None
 
     async def _set_cache(self, key: str, data: dict) -> None:
@@ -420,29 +421,25 @@ class NewsService:
         try:
             await self.redis.setex(key, REDIS_NEWS_TTL, json.dumps(data, default=str))
         except Exception as e:
-            logger.warning("[NewsCache] Écriture échouée: %s", e)
+            logger.warning("[NewsCache] Write failed: %s", e)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     async def _resolve_asset(self, ticker: str) -> Optional[Asset]:
-        """Résout l'Asset depuis son ticker via asset_listings ou asset (avec fallback pour les suffixes)."""
+        """The Asset of a ticker, through asset_listings or assets (with a fallback for suffixes)."""
         try:
-            normalized = ticker.strip().upper()
-            tickers_to_try = [normalized]
-            if "." in normalized:
-                base_ticker = normalized.split(".")[0]
-                if base_ticker and base_ticker not in tickers_to_try:
-                    tickers_to_try.append(base_ticker)
-
             async with self._session() as db:
-                for sym in tickers_to_try:
+                for lookup in ticker_lookups(ticker):
                     stmt = (
                         select(Asset)
                         .join(AssetListing, AssetListing.asset_id == Asset.id)
-                        .where(AssetListing.ticker == sym)
+                        .where(AssetListing.ticker == lookup.symbol)
                         .where(AssetListing.is_active == True)  # noqa: E712
                         .limit(1)
                     )
+                    if lookup.place is not None:
+                        # AIR.PA: the bare AIR only when it is listed in Paris.
+                        stmt = stmt.where(listing_on(lookup.place))
                     result = await db.execute(stmt)
                     asset = result.scalars().first()
                     if asset:
@@ -450,10 +447,12 @@ class NewsService:
 
                     stmt2 = (
                         select(Asset)
-                        .where(Asset.ticker == sym)
+                        .where(Asset.ticker == lookup.symbol)
                         .where(Asset.is_active == True)  # noqa: E712
                         .limit(1)
                     )
+                    if lookup.place is not None:
+                        stmt2 = stmt2.where(Asset.listings.any(listing_on(lookup.place)))
                     result2 = await db.execute(stmt2)
                     asset = result2.scalars().first()
                     if asset:
@@ -466,8 +465,8 @@ class NewsService:
 
     async def _get_provider_mappings(self, asset_id: int) -> Dict:
         """
-        Retourne les mappings providers actifs pour un actif.
-        Format : {"zonebourse": {"url": "...", "ticker": "..."}, ...}
+        The active provider mappings of an asset.
+        Format: {"zonebourse": {"url": "...", "ticker": "..."}, ...}
         """
         try:
             stmt = (
@@ -494,7 +493,7 @@ class NewsService:
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def get_stats(self) -> dict:
-        """Statistiques sur les news en base."""
+        """Statistics of the stored news."""
         try:
             results = {}
             async with self._session() as db:

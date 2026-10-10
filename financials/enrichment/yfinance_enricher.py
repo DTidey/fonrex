@@ -1,8 +1,8 @@
 """
-YFinanceEnricher — récupère et structure toutes les données fondamentales
-profondes disponibles via yfinance pour un actif donné.
+YFinanceEnricher — reads and structures every deep fundamental data point
+yfinance gives for an asset.
 
-Utilisation :
+Usage:
     enricher = YFinanceEnricher(db_service)
     await enricher.enrich(asset_id=42, ticker="AIR.PA")
 """
@@ -13,6 +13,7 @@ import math
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -20,12 +21,12 @@ from concurrency import run_sync
 
 logger = logging.getLogger(__name__)
 
-# Semaphore global pour le rate limiting yfinance (max 2 requêtes/seconde)
+# Global semaphore limiting yfinance requests (at most 2 per second)
 _yfinance_semaphore = asyncio.Semaphore(2)
 
 
 def _to_decimal(value) -> Decimal | None:
-    """Convertit une valeur en Decimal, retourne None si impossible."""
+    """A value as a Decimal; None when it cannot be converted."""
     if value is None:
         return None
     if isinstance(value, float) and (pd.isna(value) or math.isinf(value)):
@@ -53,7 +54,7 @@ def _percent_to_ratio(value) -> Decimal | None:
 
 
 def _to_int(value) -> int | None:
-    """Convertit une valeur en int, retourne None si impossible."""
+    """A value as an int; None when it cannot be converted."""
     if value is None:
         return None
     if isinstance(value, float) and (pd.isna(value) or math.isinf(value)):
@@ -65,7 +66,7 @@ def _to_int(value) -> int | None:
 
 
 def _safe_get(source, key, converter=_to_decimal):
-    """Extraction défensive avec conversion."""
+    """Defensive read with conversion."""
     if isinstance(source, dict) or isinstance(source, pd.Series):
         value = source.get(key)
     else:
@@ -74,9 +75,21 @@ def _safe_get(source, key, converter=_to_decimal):
 
 
 def _safe_date(value):
-    """Convertit un timestamp pandas/datetime en date Python."""
-    if value is None:
+    """A date from a pandas timestamp, a datetime, a text, or Yahoo epoch seconds.
+
+    Yahoo gives the dates of ``info`` (``exDividendDate``, ``dateShortInterest``,
+    ``dividendDate``) as seconds since 1970. Read by ``pd.Timestamp`` as they are,
+    they were nanoseconds: every such date became 1970-01-01.
+    """
+    if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if not math.isfinite(value) or value <= 0:
+            return None
+        try:
+            return pd.Timestamp(value, unit="s", tz="UTC").date()
+        except (ValueError, OverflowError):  # OutOfBoundsDatetime is a ValueError
+            return None
     if isinstance(value, pd.Timestamp):
         return value.date()
     if isinstance(value, datetime):
@@ -87,21 +100,37 @@ def _safe_date(value):
         return None
 
 
+def _statements_currency(t) -> str | None:
+    """Currency of the financial statements of a Yahoo ticker (``financialCurrency``).
+
+    It is not always the currency of the share price: Airbus reports in EUR,
+    a London line is quoted in pence. ``None`` when Yahoo does not give it.
+    """
+    try:
+        value = (t.info or {}).get("financialCurrency")
+    except Exception as exc:  # the statements are stored without it
+        logger.debug("financialCurrency unavailable: %s", exc)
+        return None
+    if isinstance(value, str) and len(value.strip()) == 3 and value.strip().isalpha():
+        return value.strip().upper()
+    return None
+
+
 class YFinanceEnricher:
     """
-    Enrichit un actif avec les données fondamentales profondes de yfinance.
-    Toutes les méthodes privées sont synchrones (exécutées dans un thread pool).
+    Enriches an asset with the deep fundamentals of yfinance.
+    Every private method is synchronous (run in a thread pool).
     """
 
     def __init__(self, db_service):
         """
         Args:
-            db_service: DatabaseService instance (pour obtenir des sessions).
+            db_service: DatabaseService instance (gives the sessions).
         """
         self.db_service = db_service
 
     async def enrich(self, asset_id: int, ticker: str) -> dict:
-        """Point d'entrée principal — orchestre tous les enrichissements."""
+        """Main entry point — runs every enrichment."""
         async with _yfinance_semaphore:
             yf_ticker = await run_sync(yf.Ticker, ticker)
 
@@ -146,7 +175,7 @@ class YFinanceEnricher:
             "errors": [str(r) for r in results if isinstance(r, Exception)],
         }
 
-        # Calculer les ratios de solvabilité si les statements et highlights ont réussi
+        # Compute the solvency ratios when the statements and highlights succeeded
         if summary["highlights"] and summary["statements"]:
             try:
                 await run_sync(self._fetch_solvency_ratios, asset_id)
@@ -166,7 +195,7 @@ class YFinanceEnricher:
             )
         else:
             logger.info(
-                "✅ Enrichissement yfinance complet pour %s (asset_id=%s)",
+                "✅ yfinance enrichment done for %s (asset_id=%s)",
                 ticker,
                 asset_id,
             )
@@ -185,17 +214,17 @@ class YFinanceEnricher:
     # ------------------------------------------------------------------
 
     def _fetch_highlights(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait les métriques clés depuis t.info et upsert en base."""
+        """Read the key metrics of t.info and upsert them."""
         try:
             info = t.info or {}
             if not info or len(info) <= 1:
-                logger.info("Pas de données info pour asset_id=%s", asset_id)
+                logger.info("No info data for asset_id=%s", asset_id)
                 return
 
             values = {
                 "asset_id": asset_id,
                 "fetched_at": datetime.now(timezone.utc),
-                # Valorisation
+                # Valuation
                 "market_cap": _to_decimal(info.get("marketCap")),
                 "enterprise_value": _to_decimal(info.get("enterpriseValue")),
                 "pe_ratio": _to_decimal(info.get("trailingPE")),
@@ -205,24 +234,25 @@ class YFinanceEnricher:
                 "peg_ratio": _to_decimal(info.get("pegRatio")),
                 "ev_ebitda": _to_decimal(info.get("enterpriseToEbitda")),
                 "ev_revenue": _to_decimal(info.get("enterpriseToRevenue")),
-                # Rentabilité
+                # Profitability
                 "roe": _to_decimal(info.get("returnOnEquity")),
                 "roa": _to_decimal(info.get("returnOnAssets")),
                 "roic": _to_decimal(info.get("returnOnCapital")),
                 "net_margin": _to_decimal(info.get("profitMargins")),
                 "operating_margin": _to_decimal(info.get("operatingMargins")),
                 "gross_margin": _to_decimal(info.get("grossMargins")),
-                # Par action
+                # Per share
                 "eps_trailing": _to_decimal(info.get("trailingEps")),
                 "eps_forward": _to_decimal(info.get("forwardEps")),
                 "book_value_per_share": _to_decimal(info.get("bookValue")),
                 "revenue_per_share": _to_decimal(info.get("revenuePerShare")),
-                # Dividende
+                # Dividend
                 "dividend_yield": _percent_to_ratio(info.get("dividendYield")),
                 "dividend_rate": _to_decimal(info.get("dividendRate")),
                 "dividend_ex_date": _safe_date(info.get("exDividendDate")),
+                "dividend_pay_date": _safe_date(info.get("dividendDate")),
                 "payout_ratio": _to_decimal(info.get("payoutRatio")),
-                # Technique
+                # Technical
                 "beta": _to_decimal(info.get("beta")),
                 "week_52_high": _to_decimal(info.get("fiftyTwoWeekHigh")),
                 "week_52_low": _to_decimal(info.get("fiftyTwoWeekLow")),
@@ -240,7 +270,7 @@ class YFinanceEnricher:
                 "short_percent_float": _to_decimal(info.get("shortPercentOfFloat")),
                 "short_percent_outstanding": _to_decimal(info.get("sharesPercentSharesOut")),
                 "shares_short_date": _safe_date(info.get("dateShortInterest")),
-                # TTM et croissance
+                # TTM and growth
                 "gross_profit_ttm": _to_decimal(info.get("grossProfits")),
                 "diluted_eps_ttm": _to_decimal(info.get("trailingEps")),
                 "return_on_assets_ttm": _to_decimal(info.get("returnOnAssets")),
@@ -252,19 +282,19 @@ class YFinanceEnricher:
             }
 
             self._upsert_highlights(values)
-            logger.debug("Highlights upserted pour asset_id=%s", asset_id)
+            logger.debug("Highlights upserted for asset_id=%s", asset_id)
 
         except Exception as e:
-            logger.error("Erreur _fetch_highlights asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_highlights error asset_id=%s: %s", asset_id, e)
             raise
 
     def _upsert_highlights(self, values: dict) -> None:
-        """Upsert via INSERT ... ON CONFLICT pour les highlights."""
+        """Upsert of the highlights with INSERT ... ON CONFLICT."""
         from models import FundamentalsHighlights
 
         session = self.db_service.get_session()
         try:
-            # Chercher un enregistrement existant pour cet asset
+            # Look for an existing row of this asset
             existing = (
                 session.query(FundamentalsHighlights).filter_by(asset_id=values["asset_id"]).first()
             )
@@ -288,7 +318,7 @@ class YFinanceEnricher:
     # Financial Statements (income_stmt, balance_sheet, cashflow)
     # ------------------------------------------------------------------
 
-    # Mapping des noms de lignes yfinance vers les colonnes du modèle
+    # yfinance line names → model columns
     INCOME_MAPPING = {
         "Total Revenue": "revenue",
         "Gross Profit": "gross_profit",
@@ -327,7 +357,7 @@ class YFinanceEnricher:
     }
 
     def _fetch_statements(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait les 3 états financiers × 2 périodicités."""
+        """Read the 3 financial statements × 2 frequencies."""
         try:
             statement_configs = [
                 ("income", "annual", t.income_stmt, self.INCOME_MAPPING),
@@ -338,18 +368,19 @@ class YFinanceEnricher:
                 ("cashflow", "quarterly", t.quarterly_cashflow, self.CASHFLOW_MAPPING),
             ]
 
+            currency = _statements_currency(t)
             count = 0
             for statement_type, period_type, df, mapping in statement_configs:
                 if df is None or df.empty:
                     continue
                 count += self._process_statement_df(
-                    asset_id, statement_type, period_type, df, mapping
+                    asset_id, statement_type, period_type, df, mapping, currency
                 )
 
-            logger.debug("Statements upserted pour asset_id=%s: %d périodes", asset_id, count)
+            logger.debug("Statements upserted for asset_id=%s: %d periods", asset_id, count)
 
         except Exception as e:
-            logger.error("Erreur _fetch_statements asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_statements error asset_id=%s: %s", asset_id, e)
             raise
 
     def _process_statement_df(
@@ -359,14 +390,15 @@ class YFinanceEnricher:
         period_type: str,
         df: pd.DataFrame,
         mapping: dict,
+        currency: str | None = None,
     ) -> int:
-        """Traite un DataFrame de financial statement et upsert les données."""
+        """Process a financial statement DataFrame and upsert its data."""
         from models import FinancialStatement
 
         session = self.db_service.get_session()
         count = 0
         try:
-            # Les colonnes du DataFrame sont les dates de fin de période
+            # The DataFrame columns are the period end dates
             for period_date in df.columns:
                 period_end = _safe_date(period_date)
                 if not period_end:
@@ -378,13 +410,15 @@ class YFinanceEnricher:
                     "period_type": period_type,
                     "period_end": period_end,
                     "fetched_at": datetime.now(timezone.utc),
+                    # Currency of the figures (Yahoo's financialCurrency); None when unknown.
+                    "currency": currency,
                 }
 
-                # Extraire les métriques depuis les index du DataFrame
+                # Read the metrics from the DataFrame index
                 column_data = df[period_date]
                 for yf_key, model_col in mapping.items():
                     if model_col in values:
-                        # Ne pas écraser si déjà renseigné (ex: cash_and_equivalents avec fallback)
+                        # Do not overwrite a value already set (e.g. cash_and_equivalents with its fallback)
                         if values[model_col] is not None:
                             continue
                     val = _to_decimal(column_data.get(yf_key))
@@ -429,18 +463,18 @@ class YFinanceEnricher:
     # ------------------------------------------------------------------
 
     def _fetch_earnings(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait l'historique EPS actual vs estimate."""
+        """Read the EPS history, actual vs estimate."""
         try:
             from models import EarningsHistory
 
-            # yfinance expose earnings_history comme un DataFrame
+            # yfinance gives earnings_history as a DataFrame
             try:
                 eh = t.earnings_history
             except Exception:
                 eh = None
 
             if eh is None or (isinstance(eh, pd.DataFrame) and eh.empty):
-                logger.debug("Pas d'earnings history pour asset_id=%s", asset_id)
+                logger.debug("No earnings history for asset_id=%s", asset_id)
                 return
 
             session = self.db_service.get_session()
@@ -449,7 +483,7 @@ class YFinanceEnricher:
 
                 if isinstance(eh, pd.DataFrame):
                     for _, row in eh.iterrows():
-                        # Construire le label de période
+                        # Build the period label
                         quarter = row.get("quarter")
                         period_end = row.get("period") or row.get("reportedDate")
 
@@ -492,7 +526,7 @@ class YFinanceEnricher:
 
                 session.commit()
                 logger.debug(
-                    "Earnings upserted pour asset_id=%s: %d périodes",
+                    "Earnings upserted for asset_id=%s: %d periods",
                     asset_id,
                     count,
                 )
@@ -503,7 +537,7 @@ class YFinanceEnricher:
                 session.close()
 
         except Exception as e:
-            logger.error("Erreur _fetch_earnings asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_earnings error asset_id=%s: %s", asset_id, e)
             raise
 
     # ------------------------------------------------------------------
@@ -511,23 +545,23 @@ class YFinanceEnricher:
     # ------------------------------------------------------------------
 
     def _fetch_ratings(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait le consensus analystes et l'objectif de cours."""
+        """Read the analyst consensus and the price target."""
         try:
             from models import AnalystRatings
 
-            # Objectifs de prix
+            # Price targets
             try:
                 targets = t.analyst_price_targets
             except Exception:
                 targets = None
 
-            # Recommandations
+            # Recommendations
             try:
                 recs = t.recommendations
             except Exception:
                 recs = None
 
-            # Extraire les données de prix cibles
+            # Read the price targets
             target_values = {}
             if targets is not None:
                 if isinstance(targets, dict):
@@ -539,7 +573,7 @@ class YFinanceEnricher:
                         "nb_analysts": _to_int(targets.get("numberOfAnalystOpinions")),
                     }
                 elif isinstance(targets, pd.DataFrame) and not targets.empty:
-                    # Certaines versions de yfinance retournent un DataFrame
+                    # Some yfinance versions return a DataFrame
                     row = targets.iloc[-1] if len(targets) > 0 else None
                     if row is not None:
                         target_values = {
@@ -549,11 +583,11 @@ class YFinanceEnricher:
                             "target_median": _to_decimal(row.get("mean") or row.get("median")),
                         }
 
-            # Extraire les recommandations (Strong Buy, Buy, Hold, Sell, Strong Sell)
+            # Read the recommendations (Strong Buy, Buy, Hold, Sell, Strong Sell)
             rec_values = {}
             consensus = None
             if recs is not None and isinstance(recs, pd.DataFrame) and not recs.empty:
-                # Prendre la ligne la plus récente
+                # Take the latest row
                 latest = recs.iloc[-1] if len(recs) > 0 else None
                 if latest is not None:
                     rec_values = {
@@ -564,7 +598,7 @@ class YFinanceEnricher:
                         "strong_sell": _to_int(latest.get("strongSell")),
                     }
 
-                    # Déterminer le consensus à partir des votes
+                    # Derive the consensus from the votes
                     votes = {
                         "Strong Buy": rec_values.get("strong_buy") or 0,
                         "Buy": rec_values.get("buy") or 0,
@@ -576,7 +610,7 @@ class YFinanceEnricher:
                         consensus = max(votes, key=votes.get)
 
             if not target_values and not rec_values:
-                logger.debug("Pas de ratings pour asset_id=%s", asset_id)
+                logger.debug("No ratings for asset_id=%s", asset_id)
                 return
 
             values = {
@@ -600,7 +634,7 @@ class YFinanceEnricher:
                     session.add(obj)
 
                 session.commit()
-                logger.debug("Ratings upserted pour asset_id=%s", asset_id)
+                logger.debug("Ratings upserted for asset_id=%s", asset_id)
             except Exception:
                 session.rollback()
                 raise
@@ -608,7 +642,7 @@ class YFinanceEnricher:
                 session.close()
 
         except Exception as e:
-            logger.error("Erreur _fetch_ratings asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_ratings error asset_id=%s: %s", asset_id, e)
             raise
 
     # ------------------------------------------------------------------
@@ -616,7 +650,7 @@ class YFinanceEnricher:
     # ------------------------------------------------------------------
 
     def _fetch_esg(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait les données ESG (sustainability)."""
+        """Read the ESG data (sustainability)."""
         try:
             from models import ESGScores
 
@@ -624,7 +658,7 @@ class YFinanceEnricher:
             if esg is None or (isinstance(esg, pd.DataFrame) and esg.empty):
                 return
 
-            # yfinance retourne un DataFrame avec les labels en index
+            # yfinance returns a DataFrame indexed by label
             data = esg.to_dict()[0] if isinstance(esg, pd.DataFrame) else {}
 
             values = {
@@ -668,23 +702,23 @@ class YFinanceEnricher:
                 session.close()
 
         except Exception as e:
-            logger.error("Erreur _fetch_esg asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_esg error asset_id=%s: %s", asset_id, e)
 
     # ------------------------------------------------------------------
     # Earnings Trend
     # ------------------------------------------------------------------
 
     def _fetch_earnings_trend(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait les estimations futures (Earnings & Revenue Trend)."""
+        """Read the future estimates (earnings & revenue trend)."""
         try:
             from models import EarningsTrend
 
-            # yfinance expose earnings_estimate et revenue_estimate
+            # yfinance gives earnings_estimate and revenue_estimate
             try:
                 ee = t.earnings_estimate
                 re = t.revenue_estimate
             except Exception:
-                logger.debug("Estimates non disponibles pour asset_id=%s", asset_id)
+                logger.debug("No estimates for asset_id=%s", asset_id)
                 return
 
             if ee is None or re is None or ee.empty or re.empty:
@@ -692,7 +726,7 @@ class YFinanceEnricher:
 
             session = self.db_service.get_session()
             try:
-                # On itère sur les périodes communes (0q, +1q, 0y, +1y)
+                # Iterate over the common periods (0q, +1q, 0y, +1y)
                 periods = ee.index.intersection(re.index)
                 for period in periods:
                     e_row = ee.loc[period]
@@ -734,18 +768,18 @@ class YFinanceEnricher:
             finally:
                 session.close()
         except Exception as e:
-            logger.error("Erreur _fetch_earnings_trend asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_earnings_trend error asset_id=%s: %s", asset_id, e)
 
     # ------------------------------------------------------------------
     # Outstanding Shares History
     # ------------------------------------------------------------------
 
     def _fetch_outstanding_shares(self, asset_id: int, t: yf.Ticker) -> None:
-        """Extrait l'historique des actions en circulation."""
+        """Read the history of the shares outstanding."""
         try:
             from models import OutstandingSharesHistory
 
-            # Logiciel yfinance: t.get_shares_full() retourne une série temporelle
+            # yfinance: t.get_shares_full() returns a time series
             shares = t.get_shares_full()
             if shares is None or shares.empty:
                 return
@@ -776,14 +810,14 @@ class YFinanceEnricher:
             finally:
                 session.close()
         except Exception as e:
-            logger.error("Erreur _fetch_outstanding_shares asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_outstanding_shares error asset_id=%s: %s", asset_id, e)
 
     # ------------------------------------------------------------------
     # GICS classification
     # ------------------------------------------------------------------
 
     def _fetch_gics(self, asset_id: int, t: yf.Ticker) -> None:
-        """Met à jour la classification GICS de l'actif."""
+        """Update the GICS classification of the asset."""
         try:
             from models import Asset
 
@@ -795,21 +829,21 @@ class YFinanceEnricher:
             try:
                 asset = session.get(Asset, asset_id)
                 if asset:
-                    # yfinance n'est pas top pour GICS direct, mais on mappe sector/industry
+                    # yfinance gives no direct GICS: sector/industry are mapped instead
                     asset.gic_sector = info.get("sector")
                     asset.gic_industry = info.get("industry")
                     session.commit()
             finally:
                 session.close()
         except Exception as e:
-            logger.error("Erreur _fetch_gics asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_gics error asset_id=%s: %s", asset_id, e)
 
     # ------------------------------------------------------------------
     # Solvency Ratios & Cost of Debt (Phase 13)
     # ------------------------------------------------------------------
 
     def _fetch_solvency_ratios(self, asset_id: int) -> None:
-        """Calcule les ratios de solvabilité et le coût de la dette à partir des données en base."""
+        """Compute the solvency ratios and the cost of debt from the stored data."""
         try:
             from financials.fiscal_years import fiscal_years
             from models import FinancialStatement, FundamentalsHighlights
@@ -838,7 +872,7 @@ class YFinanceEnricher:
                 if not highlights:
                     return
 
-                # Extraction sécurisée des valeurs
+                # Safe read of the values
                 total_debt = _to_decimal(latest.total_debt) or Decimal("0")
                 total_equity = _to_decimal(latest.total_equity) or Decimal("0")
                 total_assets = _to_decimal(latest.total_assets) or Decimal("0")
@@ -847,7 +881,7 @@ class YFinanceEnricher:
                 interest_expense = abs(_to_decimal(latest.interest_expense) or Decimal("0"))
                 ebit = _to_decimal(latest.operating_income) or Decimal("0")
 
-                # Calcul des ratios (protection division par zéro)
+                # Ratios (guarded against division by zero)
                 # Debt to Equity
                 if total_equity > 0:
                     highlights.debt_to_equity_ratio = total_debt / total_equity
@@ -865,21 +899,21 @@ class YFinanceEnricher:
                 if interest_expense > 0:
                     highlights.interest_coverage_ratio = ebit / interest_expense
 
-                # Coût de la dette réel (moyenne pondérée sur 3 ans)
+                # Actual cost of debt (weighted average over 3 years)
                 actual_cod, source = self._weighted_average_cost_of_debt(statements)
                 highlights.actual_cost_of_debt = actual_cod
                 highlights.cost_of_debt_source = source
 
                 session.commit()
-                logger.debug("Solvency ratios mis à jour pour asset_id=%s", asset_id)
+                logger.debug("Solvency ratios updated for asset_id=%s", asset_id)
             finally:
                 session.close()
         except Exception as e:
-            logger.error("Erreur _fetch_solvency_ratios asset_id=%s: %s", asset_id, e)
+            logger.error("_fetch_solvency_ratios error asset_id=%s: %s", asset_id, e)
             raise
 
     def _weighted_average_cost_of_debt(self, statements: list) -> tuple[Decimal | None, str]:
-        """Calcule le coût de la dette pondéré sur 3 ans maximum (50% / 30% / 20%)."""
+        """Cost of debt weighted over at most 3 years (50% / 30% / 20%)."""
         if not statements:
             return None, "sector_estimate"
 

@@ -8,6 +8,7 @@ from sqlalchemy.orm import joinedload
 
 from database.component import DatabaseComponent
 from database.price_series import session_date
+from database.ticker_suffix import listing_on, ticker_lookups
 from models import Asset, AssetListing, IngestLog, PriceEOD, UsageLog
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ class AssetRepository(DatabaseComponent):
 
     @classmethod
     def _preferred_listing_for_asset(cls, asset, listings=None):
-        """Choisit la cotation d'affichage la plus représentative pour un actif."""
+        """The most representative listing of an asset, to display."""
         listings = list(listings or [])
         if not listings:
             return None
@@ -106,7 +107,7 @@ class AssetRepository(DatabaseComponent):
 
     @staticmethod
     def _listing_to_dict(listing, asset=None):
-        """Convertit une cotation en dictionnaire API."""
+        """A listing as an API dictionary."""
         if not listing:
             return None
 
@@ -126,7 +127,7 @@ class AssetRepository(DatabaseComponent):
 
     @staticmethod
     def _asset_to_dict(asset, listing=None):
-        """Convertit un Asset en dictionnaire stable pour les réponses API."""
+        """An Asset as a stable dictionary for the API answers."""
         if not asset:
             return None
 
@@ -167,7 +168,7 @@ class AssetRepository(DatabaseComponent):
 
     @staticmethod
     def asset_profile_needs_enrichment(details):
-        """Détermine si le profil local a encore des champs métier manquants."""
+        """Whether the stored profile still misses business fields."""
         if not details:
             return False
 
@@ -184,7 +185,7 @@ class AssetRepository(DatabaseComponent):
 
     @staticmethod
     def metadata_has_profile_enrichment(metadata):
-        """Vérifie qu'une réponse provider contient au moins un champ profil utile."""
+        """Whether a provider answer holds at least one useful profile field."""
         if not metadata:
             return False
 
@@ -207,7 +208,7 @@ class AssetRepository(DatabaseComponent):
 
     @classmethod
     def asset_profile_enrichment_tickers(cls, details, request_ticker=None, limit=5):
-        """Retourne les meilleurs tickers à tenter pour enrichir un profil via yfinance."""
+        """The best tickers to try to enrich a profile with yfinance."""
         if not details:
             return []
 
@@ -266,8 +267,8 @@ class AssetRepository(DatabaseComponent):
 
     def update_asset_profile_from_metadata(self, asset_id, metadata, listing_id=None):
         """
-        Complète les champs asset/listing manquants à partir de métadonnées provider.
-        Les valeurs existantes sont conservées.
+        Fill the missing asset/listing fields from provider metadata.
+        Existing values are kept.
         """
         if not asset_id or not metadata:
             return False
@@ -280,7 +281,7 @@ class AssetRepository(DatabaseComponent):
 
             if not self._metadata_is_compatible_with_asset(asset, metadata):
                 logger.info(
-                    f"Enrichissement profil ignoré: metadata incompatible avec asset_id={asset_id}"
+                    f"Profile enrichment skipped: metadata does not match asset_id={asset_id}"
                 )
                 return False
 
@@ -358,7 +359,7 @@ class AssetRepository(DatabaseComponent):
             return updated
         except SQLAlchemyError as e:
             session.rollback()
-            logger.warning(f"Enrichissement profil asset ignoré pour asset_id={asset_id}: {e}")
+            logger.warning(f"Asset profile enrichment skipped for asset_id={asset_id}: {e}")
             return False
         finally:
             session.close()
@@ -367,10 +368,10 @@ class AssetRepository(DatabaseComponent):
         self, ticker=None, isin=None, exchange=None, currency=None, active_only=True, limit=100
     ):
         """
-        Recherche les cotations d'instruments par ticker, ISIN, exchange ou devise.
+        Search instrument listings by ticker, ISIN, exchange or currency.
 
         Returns:
-            list[AssetListing]: Cotations chargées avec l'instrument et les mappings.
+            list[AssetListing]: Listings loaded with their instrument and mappings.
         """
         session = self.get_session()
         try:
@@ -416,15 +417,14 @@ class AssetRepository(DatabaseComponent):
                 if exact_results:
                     return exact_results
 
-                if "." in normalized_ticker:
-                    base_symbol = normalized_ticker.split(".")[0]
-                    if base_symbol:
-                        query = query.filter(
-                            (AssetListing.ticker == base_symbol)
-                            | (Asset.ticker == base_symbol)
-                        )
-                else:
+                # AIR.PA: the bare AIR, only on the place the suffix names.
+                bare = ticker_lookups(normalized_ticker)[1:]
+                if not bare:
                     return []
+                query = query.filter(
+                    (AssetListing.ticker == bare[0].symbol) | (Asset.ticker == bare[0].symbol),
+                    listing_on(bare[0].place),
+                )
             if normalized_isin:
                 query = query.filter(Asset.isin == normalized_isin)
             if normalized_exchange is not None:
@@ -444,7 +444,7 @@ class AssetRepository(DatabaseComponent):
             )
         except SQLAlchemyError as e:
             logger.error(
-                f"Erreur lors de la recherche listings ticker={ticker}, isin={isin}, exchange={exchange}, currency={currency}: {e}"
+                f"Listing search error ticker={ticker}, isin={isin}, exchange={exchange}, currency={currency}: {e}"
             )
             return []
         finally:
@@ -454,7 +454,7 @@ class AssetRepository(DatabaseComponent):
         self, ticker=None, isin=None, exchange=None, currency=None, include_mappings=False
     ):
         """
-        Récupère la cotation la plus précise possible pour une identité donnée.
+        The most precise listing for an identity.
         """
         bare_ticker_lookup = bool(ticker and not isin and not exchange and not currency)
         listings = self.find_listings(
@@ -473,17 +473,17 @@ class AssetRepository(DatabaseComponent):
         self, ticker=None, isin=None, exchange=None, currency=None, include_mappings=False
     ):
         """
-        Récupère un actif via son ISIN ou une cotation ticker/exchange/currency.
+        An asset found by its ISIN or by a ticker/exchange/currency listing.
 
         Args:
-            ticker (str, optional): Symbole de marché.
-            isin (str, optional): Identifiant ISIN.
-            exchange (str, optional): Place de cotation.
-            currency (str, optional): Devise de cotation.
-            include_mappings (bool): Charge la relation Asset.mappings si nécessaire.
+            ticker (str, optional): Market symbol.
+            isin (str, optional): ISIN.
+            exchange (str, optional): Exchange.
+            currency (str, optional): Listing currency.
+            include_mappings (bool): Load the Asset.mappings relation when needed.
 
         Returns:
-            Asset: L'objet Asset correspondant, ou None.
+            Asset: The matching Asset, or None.
         """
         listing = self.get_listing_by_identity(
             ticker=ticker,
@@ -543,24 +543,22 @@ class AssetRepository(DatabaseComponent):
                 ).first()
 
             if normalized_ticker:
-                tickers_to_try = [normalized_ticker]
-                if "." in normalized_ticker:
-                    base_symbol = normalized_ticker.split(".")[0]
-                    if base_symbol and base_symbol not in tickers_to_try:
-                        tickers_to_try.append(base_symbol)
-                return (
-                    query.filter(
-                        (Asset.ticker.in_(tickers_to_try))
-                        | (Asset.official_symbol.in_(tickers_to_try))
+                for lookup in ticker_lookups(normalized_ticker):
+                    by_symbol = query.filter(
+                        (Asset.ticker == lookup.symbol) | (Asset.official_symbol == lookup.symbol)
                     )
-                    .order_by(Asset.isin.desc(), Asset.exchange.asc())
-                    .first()
-                )
+                    if lookup.place is not None:
+                        # AIR.PA: the bare AIR, only when it is listed on that place.
+                        by_symbol = by_symbol.filter(Asset.listings.any(listing_on(lookup.place)))
+                    asset = by_symbol.order_by(Asset.isin.desc(), Asset.exchange.asc()).first()
+                    if asset:
+                        return asset
+                return None
 
             return None
         except SQLAlchemyError as e:
             logger.error(
-                f"Erreur lors de la récupération asset identity ticker={ticker}, isin={isin}, exchange={exchange}, currency={currency}: {e}"
+                f"Asset identity lookup error ticker={ticker}, isin={isin}, exchange={exchange}, currency={currency}: {e}"
             )
             return None
         finally:
@@ -568,7 +566,7 @@ class AssetRepository(DatabaseComponent):
 
     def get_asset_context(self, ticker=None, isin=None, exchange=None, currency=None):
         """
-        Retourne un contexte complet instrument + cotation + mappings actifs.
+        The whole context: instrument + listing + active mappings.
         """
         asset = self.get_asset_by_identity(
             ticker=ticker, isin=isin, exchange=exchange, currency=currency, include_mappings=True
@@ -623,15 +621,15 @@ class AssetRepository(DatabaseComponent):
 
     def get_asset_details(self, ticker=None, isin=None, exchange=None, currency=None):
         """
-        Récupère les détails d'un actif (Asset) pour l'enrichissement.
+        The details of an asset, for the enrichment.
 
         Args:
-            ticker (str): Le symbole du ticker
-            isin (str, optional): Code ISIN
-            exchange (str, optional): Place de cotation
+            ticker (str): Ticker symbol
+            isin (str, optional): ISIN
+            exchange (str, optional): Exchange
 
         Returns:
-            dict: Dictionnaire avec les infos de l'asset ou None si pas trouvé
+            dict: The asset information, or None when not found
         """
         context = self.get_asset_context(
             ticker=ticker, isin=isin, exchange=exchange, currency=currency
@@ -640,10 +638,10 @@ class AssetRepository(DatabaseComponent):
 
     def get_ticker_stats(self, ticker):
         """
-        Récupère les statistiques pour un ticker spécifique.
+        Statistics of a ticker.
 
         Args:
-            ticker (str): Symbole du ticker
+            ticker (str): Ticker symbol
 
         Returns:
             tuple: (success, stats_dict, error_msg)
@@ -656,7 +654,7 @@ class AssetRepository(DatabaseComponent):
             # Find the asset
             asset = session.query(Asset).filter(func.upper(Asset.ticker) == norm_ticker).first()
             if not asset:
-                return False, None, f"Ticker {ticker} non trouvé"
+                return False, None, f"Ticker {ticker} not found"
 
             # Query PriceEOD stats
             stats_row = (
@@ -670,7 +668,7 @@ class AssetRepository(DatabaseComponent):
             )
 
             if not stats_row or stats_row.total_records == 0:
-                return False, None, f"Aucune donnée de prix trouvée pour {ticker}"
+                return False, None, f"No price data found for {ticker}"
 
             # Query latest IngestLog
             latest_log = (
@@ -702,7 +700,7 @@ class AssetRepository(DatabaseComponent):
             return True, stats, None
 
         except SQLAlchemyError as e:
-            logger.error(f"Erreur lors de la récupération des stats du ticker {ticker}: {e}")
+            logger.error(f"Ticker statistics error for {ticker}: {e}")
             return False, None, str(e)
         finally:
             session.close()
