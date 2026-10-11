@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 from concurrency import run_sync
@@ -39,6 +40,8 @@ class CachedRateService:
     source = "macro"
     #: Currency (or currency area) the series of the source belong to.
     currency: str | None = None
+    #: Lock serializing DB operations across worker threads (e.g. SQLite StaticPool).
+    _db_lock = threading.Lock()
 
     def __init__(self, db_service, redis_client=None):
         self.db_service = db_service
@@ -124,62 +127,64 @@ class CachedRateService:
 
     def _upsert_rate(self, rate: MacroRate) -> None:
         """Save the fetched rate to PostgreSQL."""
-        session = self.db_service.get_session()
-        try:
-            existing = (
-                session.query(MacroRateCache)
-                .filter_by(series_id=rate.series_id, observation_date=rate.observation_date)
-                .first()
-            )
-            if existing:
-                # Same observation (published on business days): the value may
-                # have been revised, and the row was confirmed just now.
-                existing.value = rate.value
-                existing.source = self.source
-                existing.fetched_at = datetime.now(timezone.utc)
-            else:
-                session.add(
-                    MacroRateCache(
-                        series_id=rate.series_id,
-                        source=self.source,
-                        label=rate.label,
-                        value=rate.value,
-                        unit=rate.unit,
-                        observation_date=rate.observation_date,
-                        fetched_at=datetime.now(timezone.utc),
-                    )
+        with self._db_lock:
+            session = self.db_service.get_session()
+            try:
+                existing = (
+                    session.query(MacroRateCache)
+                    .filter_by(series_id=rate.series_id, observation_date=rate.observation_date)
+                    .first()
                 )
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            logger.error("MacroRateCache upsert error: %s", e)
-        finally:
-            session.close()
+                if existing:
+                    # Same observation (published on business days): the value may
+                    # have been revised, and the row was confirmed just now.
+                    existing.value = rate.value
+                    existing.source = self.source
+                    existing.fetched_at = datetime.now(timezone.utc)
+                else:
+                    session.add(
+                        MacroRateCache(
+                            series_id=rate.series_id,
+                            source=self.source,
+                            label=rate.label,
+                            value=rate.value,
+                            unit=rate.unit,
+                            observation_date=rate.observation_date,
+                            fetched_at=datetime.now(timezone.utc),
+                        )
+                    )
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error("MacroRateCache upsert error: %s", e)
+            finally:
+                session.close()
 
     def _get_latest_from_db(self, series_id: str) -> tuple[MacroRate | None, datetime | None]:
         """The most recent value stored for a series, and when it was read from the source."""
-        session = self.db_service.get_session()
-        try:
-            latest = (
-                session.query(MacroRateCache)
-                .filter_by(series_id=series_id)
-                .order_by(MacroRateCache.observation_date.desc())
-                .first()
-            )
-            if latest:
-                return (
-                    MacroRate(
-                        series_id=latest.series_id,
-                        label=latest.label,
-                        value=latest.value,
-                        unit=_unit(latest.unit),
-                        observation_date=latest.observation_date,
-                    ),
-                    latest.fetched_at,
+        with self._db_lock:
+            session = self.db_service.get_session()
+            try:
+                latest = (
+                    session.query(MacroRateCache)
+                    .filter_by(series_id=series_id)
+                    .order_by(MacroRateCache.observation_date.desc())
+                    .first()
                 )
-            return None, None
-        except Exception as e:
-            logger.error("MacroRateCache database read error: %s", e)
-            return None, None
-        finally:
-            session.close()
+                if latest:
+                    return (
+                        MacroRate(
+                            series_id=latest.series_id,
+                            label=latest.label,
+                            value=latest.value,
+                            unit=_unit(latest.unit),
+                            observation_date=latest.observation_date,
+                        ),
+                        latest.fetched_at,
+                    )
+                return None, None
+            except Exception as e:
+                logger.error("MacroRateCache database read error: %s", e)
+                return None, None
+            finally:
+                session.close()
