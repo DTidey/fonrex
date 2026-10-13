@@ -76,8 +76,8 @@ curl -H "$AUTH" "http://localhost:5000/dcf/AIR.PA"                          # in
 curl -H "$AUTH" "http://localhost:5000/factors/exposure/AIR.PA?model=ff5"   # Fama/French betas
 ```
 
-The interactive API documentation is on `http://localhost:5000/docs`. To feed the whole
-documentation to an LLM, use [llms.txt](https://docs.fonrex.io/llms.txt).
+The interactive API documentation is on `https://fonrex.io/`. To feed the whole
+documentation to an LLM, use [llms.txt](https://fonrex.io/llms.txt).
 
 ---
 
@@ -138,7 +138,7 @@ Finance, deduplicated by URL and by title similarity.
 |---|---|
 | **[OpenBB Workspace](integrations/openbb/README.md)** | Your instance as a data source: quotes, fundamentals, DCF, technical charts, news, macro rates and factors in ready-made dashboards — 21 available widgets |
 | **[Google Sheets](fonrex-sheets-connector/README.md)** | Fundamentals, DCF values and indicators in a spreadsheet, with a read-only key |
-| **Python & Jupyter** | Plain REST and JSON with `httpx` or `requests` and pandas — see the [notebook guide](https://docs.fonrex.io/docs/guides/python-jupyter) |
+| **Python & Jupyter** | Plain REST and JSON with `httpx` or `requests` and pandas — see the [notebook guide](https://fonrex.io/docs/guides/python-jupyter) |
 | **[Zipline](docs/zipline-bundle.md)** | A data bundle reading your stored prices, for backtests |
 
 ---
@@ -159,7 +159,7 @@ Finance, deduplicated by URL and by title similarity.
 Every route requires an API key, sent as `X-API-KEY` or `Authorization: Bearer`. Keys listed
 in `FONREX_READ_ONLY_API_KEYS` can read everything but change nothing: use one for any client
 that stores the key outside your machine. The full reference, with parameters and examples,
-is in the [documentation](https://docs.fonrex.io/docs/intro).
+is in the [documentation](https://fonrex.io/docs/intro).
 
 ---
 
@@ -203,7 +203,7 @@ Copy `.env.example` to `.env` and adjust it. The main settings:
 | `USAGE_LOG_IP` | `none` | Whether the local usage log keeps caller IPs |
 
 Every variable is described in `.env.example` and in the
-[configuration guide](https://docs.fonrex.io/docs/getting-started/configuration).
+[configuration guide](https://fonrex.io/docs/getting-started/configuration).
 
 </details>
 
@@ -232,7 +232,7 @@ docker compose exec -T db pg_dump -U fonrex -d fonrex -Fc > fonrex.dump
 - **Container name already in use**: `docker rm -f fonrex-db fonrex-redis fonrex-api`.
 
 Restoring a backup, upgrading an older installation and cleaning old prices are covered in the
-[deployment guides](https://docs.fonrex.io/docs/deployment/docker).
+[deployment guides](https://fonrex.io/docs/deployment/docker).
 
 </details>
 
@@ -299,5 +299,5 @@ responsible for respecting the terms of use of each source. Read the [DISCLAIMER
 
 <p align="center">
   Built for people who want to own their financial data stack.<br/>
-  <a href="https://docs.fonrex.io/docs/intro">Documentation</a> · <a href="https://github.com/fonrex/fonrex/issues">Issues</a>
+  <a href="https://fonrex.io/docs/intro">Documentation</a> · <a href="https://github.com/fonrex/fonrex/issues">Issues</a>
 </p>
