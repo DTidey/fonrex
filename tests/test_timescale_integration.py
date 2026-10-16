@@ -1141,3 +1141,277 @@ class TestFactorExposureReadsTheListing:
         # Daily bars only; the dividend-adjusted close, else the close.
         assert closes == {date(2026, 9, 29): 9.5, date(2026, 9, 30): 11.0}
         assert missing == (None, None, {})
+
+
+class TestSecCikOnPostgres:
+    """``financials.sec_cik``: the CIK kept in the ``SEC`` mapping of the instrument."""
+
+    async def test_found_then_reused_and_shared_by_every_listing(self, database_url, engine):
+        import json
+
+        from financials.sec_cik import NOT_FOUND, SecCikResolver, SqlCikStore
+
+        table = json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "sec" / "company_tickers_exchange.json").read_text()
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO assets (id, ticker, name, currency, is_active, isin, quote_type)
+                    VALUES (88, 'SAP', 'SAP SE', 'EUR', true, 'DE0007164600', 'EQUITY'),
+                           (89, 'AIR', 'Airbus SE', 'EUR', true, 'NL0000235190', 'EQUITY');
+                    INSERT INTO asset_listings
+                        (id, asset_id, ticker, exchange, currency, source, is_primary, is_active,
+                         created_at, updated_at)
+                    VALUES (880, 88, 'SAP', 'XETR', 'EUR', 'csv', true, true, now(), now()),
+                           (881, 88, 'SAP', 'NYSE', 'USD', 'csv', false, true, now(), now()),
+                           (890, 89, 'AIR', 'XPAR', 'EUR', 'csv', true, true, now(), now());
+                """)
+            )
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        source = AsyncMock(return_value=table)
+        resolver = SecCikResolver(SqlCikStore(async_sessionmaker(async_engine)), source)
+        try:
+            sap = await resolver.resolve(88)
+            again = await resolver.resolve(88)
+            airbus = await resolver.resolve(89)
+            # A CIK no longer confirmed is switched off.
+            source.return_value = {"fields": table["fields"], "data": []}
+            lost = await resolver.resolve(88, refresh=True)
+        finally:
+            await async_engine.dispose()
+
+        assert sap.cik == again.cik == "0001000184"
+        assert airbus.cik is None and source.await_count == 2  # Airbus: the SEC is not asked
+        assert lost.cik is None and lost.origin == NOT_FOUND
+        with engine.begin() as connection:
+            rows = connection.execute(
+                text("""
+                    SELECT asset_id, asset_listing_id, provider_ticker, source, is_active,
+                           last_verified_at IS NULL, failure_count
+                    FROM asset_mappings WHERE provider_name = 'SEC' ORDER BY asset_id
+                """)
+            ).all()
+            connection.execute(text("DELETE FROM asset_mappings WHERE asset_id IN (88, 89)"))
+            connection.execute(text("DELETE FROM asset_listings WHERE asset_id IN (88, 89)"))
+            connection.execute(text("DELETE FROM assets WHERE id IN (88, 89)"))
+        # One row for the instrument (no listing), kept with the last CIK, switched off.
+        assert [tuple(row) for row in rows] == [
+            (88, None, "0001000184", NOT_FOUND, False, True, 1)
+        ]
+
+
+class TestXbrlFactsOnPostgres:
+    """Revision 023: the facts of the XBRL filings of the SEC."""
+
+    UPSERT = text("""
+        INSERT INTO xbrl_facts
+            (cik, taxonomy, concept, unit, period_end, duration_days, period_start, value,
+             accession, form, fiscal_year, fiscal_period, filed, frame)
+        VALUES ('0001000184', 'ifrs-full', 'Assets', 'EUR', DATE '2024-12-31', 0, NULL,
+                :value, :accession, '20-F', :fy, 'FY', :filed, NULL)
+        ON CONFLICT (cik, taxonomy, concept, unit, period_end, duration_days)
+        DO UPDATE SET value = EXCLUDED.value, accession = EXCLUDED.accession,
+                      fiscal_year = EXCLUDED.fiscal_year, filed = EXCLUDED.filed
+        WHERE EXCLUDED.filed >= xbrl_facts.filed
+    """)
+
+    def test_a_restatement_replaces_the_first_figure_and_an_older_filing_does_not(self, engine):
+        first = {"value": 74122000000, "accession": "0001104659-25-017815", "fy": 2024,
+                 "filed": date(2025, 2, 27)}
+        restated = {"value": 74237000000, "accession": "0001104659-26-020058", "fy": 2025,
+                    "filed": date(2026, 2, 26)}
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM xbrl_facts"))
+            connection.execute(self.UPSERT, first)
+            connection.execute(self.UPSERT, restated)
+            connection.execute(self.UPSERT, first)  # read again from the older filing
+            rows = connection.execute(
+                text("SELECT value, accession, filed FROM xbrl_facts")
+            ).all()
+            connection.execute(text("DELETE FROM xbrl_facts"))
+        assert [(int(value), accession, filed) for value, accession, filed in rows] == [
+            (74237000000, "0001104659-26-020058", date(2026, 2, 26))
+        ]
+
+    def test_a_year_and_a_quarter_ending_the_same_day_are_two_facts(self, engine):
+        insert = text("""
+            INSERT INTO xbrl_facts (cik, taxonomy, concept, unit, period_end, duration_days,
+                                    period_start, value, accession, form, filed)
+            VALUES ('0000320193', 'us-gaap', 'Revenues', 'USD', DATE '2025-09-27', :days,
+                    :start, :value, '0000320193-25-000079', '10-K', DATE '2025-10-31')
+        """)
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM xbrl_facts"))
+            connection.execute(insert, {"days": 363, "start": date(2024, 9, 29), "value": 416161000000})
+            connection.execute(insert, {"days": 90, "start": date(2025, 6, 29), "value": 100000000000})
+            count = connection.execute(text("SELECT count(*) FROM xbrl_facts")).scalar()
+            connection.execute(text("DELETE FROM xbrl_facts"))
+        assert count == 2
+
+    def test_downgrade_drops_the_tables_and_upgrade_creates_them(self, database_url, engine):
+        _alembic(database_url, "downgrade", "022")
+        with engine.connect() as connection:
+            for table in ("xbrl_facts", "sec_company_loads"):
+                assert connection.execute(
+                    text("SELECT to_regclass(:table)"), {"table": table}
+                ).scalar() is None
+        _alembic(database_url, "upgrade", "head")
+        with engine.connect() as connection:
+            for table in ("xbrl_facts", "sec_company_loads"):
+                assert connection.execute(
+                    text("SELECT to_regclass(:table)"), {"table": table}
+                ).scalar()
+
+
+class TestSecStatementsOnPostgres:
+    """``financials.sec_statements``: facts of the SEC stored, then read as fiscal years."""
+
+    @pytest.fixture
+    async def statements(self, database_url, engine):
+        from financials.sec_cik import CikResolution
+        from financials.sec_statements import SecStatements
+
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM xbrl_facts"))
+            connection.execute(text("DELETE FROM sec_company_loads"))
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        provider, resolver = MagicMock(), MagicMock()
+        resolver.resolve = AsyncMock(
+            return_value=CikResolution("0001000184", origin="ticker_check", company_name="SAP SE")
+        )
+        provider.company_facts = AsyncMock()
+        yield SecStatements(async_sessionmaker(async_engine), provider, resolver), provider, resolver
+        await async_engine.dispose()
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM xbrl_facts"))
+            connection.execute(text("DELETE FROM sec_company_loads"))
+
+    async def test_read_stored_then_reused_and_read_as_fiscal_years(self, statements):
+        import json
+
+        service, provider, _ = statements
+        answer = json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "sec" / "companyfacts_sap.json").read_text()
+        )
+        provider.company_facts.return_value = answer
+
+        first = await service.refresh(1)
+        assert (first.status, first.cik, first.entity_name, first.last_filed) == (
+            "fetched",
+            "0001000184",
+            "SAP SE",
+            date(2026, 2, 26),
+        )
+        assert first.facts == 26  # 13 concepts, two fiscal years, latest filing each
+        assert (await service.refresh(1)).status == "fresh"
+        provider.company_facts.assert_awaited_once_with("0001000184")
+
+        load, years = await service.annual(1, refresh=False)
+        assert load.status == "fresh"
+        assert [year.period_end for year in years] == [date(2025, 12, 31), date(2024, 12, 31)]
+        assert years[0].currency == "EUR"
+        assert years[0].value("revenue") == Decimal("36800000000")
+        assert years[1].value("total_assets") == Decimal("74237000000")  # restated
+
+    async def test_an_older_filing_read_later_does_not_replace_a_restatement(self, statements):
+        service, provider, _ = statements
+        restated = {"start": None, "end": "2024-12-31", "accn": "0001104659-26-020058",
+                    "form": "20-F", "filed": "2026-02-26", "fy": 2025, "fp": "FY"}
+        first = {**restated, "accn": "0001104659-25-017815", "filed": "2025-02-27", "fy": 2024}
+
+        def facts(*entries):
+            return {"entityName": "SAP SE", "facts": {"ifrs-full": {"Assets": {"units": {"EUR": [
+                {key: value for key, value in entry.items() if value is not None} for entry in entries
+            ]}}}}}
+
+        provider.company_facts.return_value = facts({**restated, "val": 74237000000})
+        await service.refresh(1, force=True)
+        provider.company_facts.return_value = facts({**first, "val": 74122000000})
+        await service.refresh(1, force=True)
+
+        (row,) = await service.stored_rows("0001000184")
+        assert (row.value, row.accession) == (Decimal("74237000000.000000"), "0001104659-26-020058")
+
+    async def test_a_failed_reading_keeps_what_was_stored(self, statements):
+        service, provider, _ = statements
+        provider.company_facts.return_value = {"entityName": "SAP SE", "facts": {}}
+        await service.refresh(1, force=True)
+        provider.company_facts.return_value = None
+
+        failed = await service.refresh(1, force=True)
+
+        assert (failed.status, failed.entity_name, failed.reason) == (
+            "failed",
+            "SAP SE",
+            "XbrlError: no answer from the SEC",
+        )
+
+    async def test_without_cik_the_sec_is_not_asked(self, statements):
+        from financials.sec_cik import CikResolution
+
+        service, provider, resolver = statements
+        resolver.resolve.return_value = CikResolution(None, "No US listing in the catalogue")
+
+        load, years = await service.annual(1)
+
+        assert (load.status, load.reason, years) == ("no_cik", "No US listing in the catalogue", [])
+        provider.company_facts.assert_not_awaited()
+
+
+class TestSecCheckOnPostgres:
+    """``financials.sec_check``: the Yahoo statements read by fiscal year from the database."""
+
+    async def test_the_three_rows_of_a_year_are_read_together(self, database_url, engine):
+        import json
+        from types import SimpleNamespace
+
+        from financials.sec_check import MATCH, SecCheck
+        from financials.xbrl_mapping import annual_statements, facts_to_rows
+
+        answer = json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "sec" / "companyfacts_aapl.json").read_text()
+        )
+        sec_years = annual_statements(facts_to_rows("0000320193", answer))
+        with engine.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO assets (id, ticker, name, currency, is_active, isin, quote_type)
+                    VALUES (91, 'AAPL', 'Apple Inc.', 'USD', true, 'US0000000091', 'EQUITY');
+                    INSERT INTO financial_statements
+                        (asset_id, statement_type, period_type, period_end, currency,
+                         revenue, net_income, total_assets, operating_cashflow, capex)
+                    VALUES
+                        (91, 'income', 'annual', DATE '2025-09-30', 'USD',
+                         416161000000, 112010000000, NULL, NULL, NULL),
+                        (91, 'balance', 'annual', DATE '2025-09-30', 'USD',
+                         NULL, NULL, 359241000000, NULL, NULL),
+                        (91, 'cashflow', 'annual', DATE '2025-09-30', 'USD',
+                         NULL, NULL, NULL, 111482000000, -12715000000),
+                        (91, 'income', 'quarterly', DATE '2025-09-30', 'USD',
+                         1, NULL, NULL, NULL, NULL);
+                """)
+            )
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        statements = MagicMock()
+        statements.annual = AsyncMock(return_value=(SimpleNamespace(status="fresh"), sec_years))
+        try:
+            result = await SecCheck(async_sessionmaker(async_engine), statements).check(91)
+        finally:
+            await async_engine.dispose()
+            with engine.begin() as connection:
+                connection.execute(text("DELETE FROM financial_statements WHERE asset_id = 91"))
+                connection.execute(text("DELETE FROM assets WHERE id = 91"))
+
+        latest = result.years[0]
+        figures = {figure.column: figure.status for figure in latest.figures}
+        assert latest.yahoo_period_end == date(2025, 9, 30)
+        # One row per statement, read together; the quarterly row is not an annual figure.
+        for column in ("revenue", "net_income", "total_assets", "operating_cashflow", "capex"):
+            assert figures[column] == MATCH, column

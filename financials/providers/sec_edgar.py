@@ -67,6 +67,18 @@ _TRANSACTION_CODES = {
 
 # ── Provider ──────────────────────────────────────────────────────────────────
 
+# The address of the example configuration. The SEC asks every automated client
+# to name who runs it: an instance that keeps it speaks in the name of Fonrex.
+DEFAULT_SEC_EMAIL = "contact@fonrex.io"
+
+
+def uses_default_contact() -> bool:
+    """Whether ``SEC_EDGAR_EMAIL`` is unset or still the address of the example."""
+    email = (os.environ.get("SEC_EDGAR_EMAIL") or "").strip().lower()
+    return email in ("", DEFAULT_SEC_EMAIL)
+
+
+
 
 class SECEdgarProvider(BaseFinancialProvider):
     """SEC EDGAR provider of the Form 4 insider transactions."""
@@ -80,13 +92,31 @@ class SECEdgarProvider(BaseFinancialProvider):
     BASE_URL = "https://data.sec.gov"
     ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data"
     TICKER_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
+    # Every ticker of the SEC with its CIK, company name and exchange (about 10 000 rows).
+    TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 
     def __init__(self):
-        self._sec_email = os.environ.get("SEC_EDGAR_EMAIL", "contact@fonrex.io")
+        self._sec_email = os.environ.get("SEC_EDGAR_EMAIL", DEFAULT_SEC_EMAIL)
         self._sec_ua = f"Fonrex {self._sec_email}"
 
     def _sec_headers(self) -> dict:
         return {"User-Agent": self._sec_ua, "Accept": "application/json"}
+
+    async def ticker_table(self) -> Optional[dict]:
+        """The table of the tickers of the SEC, with their exchange (``None`` when not read).
+
+        Read by ``financials/sec_cik.py``, which verifies a CIK before any use.
+        """
+        return await self._get_json(self.TICKERS_EXCHANGE_URL, headers=self._sec_headers())
+
+    async def company_facts(self, cik: str) -> Optional[dict]:
+        """Every XBRL fact filed by a company (``None`` when not read: unknown CIK or failure).
+
+        Several megabytes for a large company. ``cik`` must come from
+        ``financials/sec_cik.py``: it is never derived from a ticker here.
+        """
+        url = f"{self.BASE_URL}/api/xbrl/companyfacts/CIK{str(cik).zfill(10)}.json"
+        return await self._get_json(url, headers=self._sec_headers())
 
     async def fetch(
         self,

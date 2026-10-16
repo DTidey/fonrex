@@ -136,7 +136,7 @@ Finance, deduplicated by URL and by title similarity.
 
 | Tool | What you get |
 |---|---|
-| **[OpenBB Workspace](integrations/openbb/README.md)** | Your instance as a data source: quotes, fundamentals, DCF, technical charts, news, macro rates and factors in ready-made dashboards — 23 available widgets |
+| **[OpenBB Workspace](integrations/openbb/README.md)** | Your instance as a data source: quotes, fundamentals, DCF, technical charts, news, macro rates and factors in ready-made dashboards — 24 available widgets |
 | **[Google Sheets](fonrex-sheets-connector/README.md)** | Fundamentals, DCF values and indicators in a spreadsheet, with a read-only key |
 | **Python & Jupyter** | Plain REST and JSON with `httpx` or `requests` and pandas — see the [notebook guide](https://fonrex.io/docs/guides/python-jupyter) |
 | **[Zipline](docs/zipline-bundle.md)** | A data bundle reading your stored prices, for backtests |
@@ -149,6 +149,7 @@ Finance, deduplicated by URL and by title similarity.
 |---|---|
 | Prices | `GET /eod/{ticker}` · `GET /ticker/{symbol}/history` · `POST /historical/ingest` · `GET /quote/{ticker}` · `GET /quotes` · `WS /ws/realtime/{ticker}` |
 | Fundamentals | `GET /fundamental` · `GET /fundamental/deep` · `GET /etf/{isin}/details` · `GET /insider-transactions/{ticker}` · `GET /index/{name}/constituents` |
+| SEC filings | `GET /sec/{ticker}/statements` · `GET /sec/{ticker}/check` · `POST /sec/{ticker}/refresh` |
 | Valuation | `GET /dcf/{ticker}` · `POST /dcf/{ticker}` · `GET /dcf/{ticker}/compare` · `GET /dcf/{ticker}/sensitivity` |
 | Factors and rates | `GET /factors` · `GET /factors/{dataset}` · `GET /factors/exposure/{ticker}` · `GET /macro/rates` · `GET /macro/indicators` · `GET /macro/indicators/{indicator}` |
 | Technical analysis | `GET /technical/{ticker}` · `GET /technical/{ticker}/multi` · `GET /technical/{ticker}/chart` · `GET /technical/screen` |
