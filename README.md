@@ -88,19 +88,19 @@ documentation to an LLM, use [llms.txt](https://fonrex.io/llms.txt).
 | 📈 **Prices** | Ten years of daily history by default, per listing; traded prices adjusted for splits and an `adj_close` adjusted for dividends; weekly and monthly bars; realtime ticks over WebSocket |
 | 🧾 **Fundamentals** | Statements, highlights, earnings, analyst ratings, ESG scores, ETF details and holdings, insider transactions (SEC) |
 | 💶 **Valuation** | FCF, EPS and dividend DCF models, model comparison, WACC × growth sensitivity matrix, cost of equity from the CAPM or the Fama/French factors |
-| 🧮 **Factors and rates** | Kenneth French factor returns (US, Europe, developed markets), factor exposure of a listing, FRED and ECB rates, ECB exchange rates, Eurostat indicators by country (inflation, unemployment, GDP growth, economic sentiment) |
+| 🧮 **Factors and rates** | Kenneth French factor returns (US, Europe, developed markets), factor exposure of a listing, FRED and ECB rates, US Treasury yield curves (nominal and real, daily since 1990), ECB exchange rates, Eurostat indicators by country (inflation, unemployment, GDP growth, economic sentiment) |
 | 📊 **Technical analysis** | Indicators computed on your stored prices, multi-indicator reads, a screener |
 | 📰 **News** | Deduplicated articles from several sources, per ticker and as a global feed |
 | 🛡️ **Data quality** | Range checks, cross-source consensus, a daily canary run and alerts on every provider |
 
-### Fundamentals (18 providers)
+### Fundamentals (19 providers)
 
 | Group | Providers |
 |---|---|
 | **Europe** | ZoneBourse, Boursorama, BourseDirect, Fortuneo, InvestirLesEchos |
 | **Global** | Yahoo Finance, Google Finance, MSN, MorningStar, Investing.com |
 | **US** | Barron's, WSJ, MarketWatch, Gurufocus |
-| **Specialised** | JustETF (UCITS ETFs), SEC Edgar (insider transactions), OpenFIGI, index constituents |
+| **Specialised** | JustETF (UCITS ETFs), SEC Edgar (insider transactions), OpenFIGI, index constituents, US Treasury (yield curves) |
 
 `GET /fundamental` returns one document in the EODHD layout. Each figure is taken from Yahoo
 (with the symbol verified for the listing, never the bare ticker), then from the stored
@@ -136,7 +136,7 @@ Finance, deduplicated by URL and by title similarity.
 
 | Tool | What you get |
 |---|---|
-| **[OpenBB Workspace](integrations/openbb/README.md)** | Your instance as a data source: quotes, fundamentals, DCF, technical charts, news, macro rates and factors in ready-made dashboards — 24 available widgets |
+| **[OpenBB Workspace](integrations/openbb/README.md)** | Your instance as a data source: quotes, fundamentals, DCF, technical charts, news, macro rates and factors in ready-made dashboards — 26 available widgets |
 | **[Google Sheets](fonrex-sheets-connector/README.md)** | Fundamentals, DCF values and indicators in a spreadsheet, with a read-only key |
 | **Python & Jupyter** | Plain REST and JSON with `httpx` or `requests` and pandas — see the [notebook guide](https://fonrex.io/docs/guides/python-jupyter) |
 | **[Zipline](docs/zipline-bundle.md)** | A data bundle reading your stored prices, for backtests |
@@ -151,7 +151,7 @@ Finance, deduplicated by URL and by title similarity.
 | Fundamentals | `GET /fundamental` · `GET /fundamental/deep` · `GET /etf/{isin}/details` · `GET /insider-transactions/{ticker}` · `GET /index/{name}/constituents` |
 | SEC filings | `GET /sec/{ticker}/statements` · `GET /sec/{ticker}/check` · `POST /sec/{ticker}/refresh` |
 | Valuation | `GET /dcf/{ticker}` · `POST /dcf/{ticker}` · `GET /dcf/{ticker}/compare` · `GET /dcf/{ticker}/sensitivity` |
-| Factors and rates | `GET /factors` · `GET /factors/{dataset}` · `GET /factors/exposure/{ticker}` · `GET /macro/rates` · `GET /macro/indicators` · `GET /macro/indicators/{indicator}` |
+| Factors and rates | `GET /factors` · `GET /factors/{dataset}` · `GET /factors/exposure/{ticker}` · `GET /macro/rates` · `GET /macro/indicators` · `GET /macro/indicators/{indicator}` · `GET /macro/treasury/curve` · `GET /macro/treasury/series` |
 | Technical analysis | `GET /technical/{ticker}` · `GET /technical/{ticker}/multi` · `GET /technical/{ticker}/chart` · `GET /technical/screen` |
 | News | `GET /news/{ticker}` · `GET /news/feed` |
 | Assets | `GET /assets/by-isin/{isin}` · `GET /listings` |
@@ -180,7 +180,7 @@ is in the [documentation](https://fonrex.io/docs/intro).
 ┌──────▼──────┐  ┌──────▼───────┐  ┌───────▼───────────────┐
 │   Redis 7   │  │  TimescaleDB │  │   Public sources      │
 │  cache and  │  │  PostgreSQL  │  │  Yahoo / TradingView  │
-│  pub/sub    │  │  your data   │  │  18 providers         │
+│  pub/sub    │  │  your data   │  │  19 providers         │
 └─────────────┘  └──────────────┘  └───────────────────────┘
 ```
 
