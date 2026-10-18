@@ -30,6 +30,7 @@ import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -1825,3 +1826,471 @@ class TestTreasuryScriptOnPostgres:
         # 2025 was read after its end: only 2026 could be read again, and it is up to date.
         assert fake_network.calls("daily-treasury-rates.csv") == 4
         assert "fresh" in second_output.splitlines()[0]
+
+
+class TestCotTablesOnPostgres:
+    """Revision 025: the Commitments of Traders reports of the CFTC."""
+
+    WEEK = text("""
+        INSERT INTO cot_weeks
+            (report, market_code, report_date, market_name, contract_units, open_interest, fetched_at)
+        VALUES (:report, :code, :day, :name, :units, :oi, now())
+    """)
+    POSITION = text("""
+        INSERT INTO cot_positions (report, market_code, report_date, category, long, short, spreading)
+        VALUES (:report, :code, :day, :category, :long, :short, :spreading)
+    """)
+
+    @staticmethod
+    def _clean(connection):
+        connection.execute(text("DELETE FROM cot_positions"))
+        connection.execute(text("DELETE FROM cot_weeks"))
+        connection.execute(text("DELETE FROM cot_loads"))
+
+    def _gold(self, connection, day=date(2026, 10, 13), report="legacy"):
+        connection.execute(
+            self.WEEK,
+            {
+                "report": report,
+                "code": "088691",
+                "day": day,
+                "name": "GOLD - COMMODITY EXCHANGE INC.",
+                "units": "(CONTRACTS OF 100 TROY OUNCES)",
+                "oi": 396345,
+            },
+        )
+        for category, long, short, spreading in (
+            ("noncommercial", 245300, 37421, 45895),
+            ("commercial", 54419, 296950, None),
+            ("nonreportable", 50731, 16079, None),
+        ):
+            connection.execute(
+                self.POSITION,
+                {
+                    "report": report,
+                    "code": "088691",
+                    "day": day,
+                    "category": category,
+                    "long": long,
+                    "short": short,
+                    "spreading": spreading,
+                },
+            )
+
+    def test_a_line_and_the_positions_of_each_type_of_trader(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            self._gold(connection)
+            rows = connection.execute(
+                text("""
+                    SELECT p.category, p.long - p.short AS net, p.spreading, w.open_interest
+                    FROM cot_positions p
+                    JOIN cot_weeks w USING (report, market_code, report_date)
+                    ORDER BY p.category
+                """)
+            ).all()
+            self._clean(connection)
+        assert [tuple(row) for row in rows] == [
+            ("commercial", -242531, None, 396345),
+            ("noncommercial", 207879, 45895, 396345),
+            ("nonreportable", 34652, None, 396345),
+        ]
+
+    def test_a_file_read_again_replaces_its_lines_and_their_positions(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            self._gold(connection)
+            connection.execute(
+                text(
+                    "DELETE FROM cot_weeks WHERE report = 'legacy' AND report_date >= '2026-01-01'"
+                )
+            )
+            left = connection.execute(text("SELECT count(*) FROM cot_positions")).scalar()
+            self._gold(connection)
+            again = connection.execute(text("SELECT count(*) FROM cot_positions")).scalar()
+            self._clean(connection)
+        assert (left, again) == (0, 3)
+
+    def test_the_same_market_in_two_reports(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            self._gold(connection, report="legacy")
+            self._gold(connection, report="disaggregated")
+            lines = connection.execute(text("SELECT count(*) FROM cot_weeks")).scalar()
+            self._clean(connection)
+        assert lines == 2
+
+    def test_a_position_without_its_line_is_refused(self, engine):
+        with pytest.raises(IntegrityError), engine.begin() as connection:
+            connection.execute(
+                self.POSITION,
+                {
+                    "report": "legacy",
+                    "code": "13874A",
+                    "day": date(2026, 10, 13),
+                    "category": "noncommercial",
+                    "long": 1,
+                    "short": 1,
+                    "spreading": 0,
+                },
+            )
+
+    def test_negative_and_large_numbers_of_contracts(self, engine):
+        day = date(1987, 6, 30)
+        with engine.begin() as connection:
+            self._clean(connection)
+            connection.execute(
+                self.WEEK,
+                {
+                    "report": "legacy",
+                    "code": "043602",
+                    "day": day,
+                    "name": "6.5-10 YEAR U.S. TREASURY NOTE - CHICAGO BOARD OF TRADE",
+                    "units": None,
+                    "oi": 3_000_000_000,
+                },
+            )
+            connection.execute(
+                self.POSITION,
+                {
+                    "report": "legacy",
+                    "code": "043602",
+                    "day": day,
+                    "category": "nonreportable",
+                    "long": -984,
+                    "short": 1758,
+                    "spreading": None,
+                },
+            )
+            row = connection.execute(
+                text("""
+                    SELECT w.open_interest, w.contract_units, p.long
+                    FROM cot_weeks w JOIN cot_positions p USING (report, market_code, report_date)
+                """)
+            ).one()
+            self._clean(connection)
+        assert tuple(row) == (3_000_000_000, None, -984)
+
+    def test_the_dates_of_a_report_read_the_report_date_index(self, engine):
+        with engine.connect() as connection:
+            columns = (
+                connection.execute(
+                    text("""
+                    SELECT a.attname FROM pg_index i
+                    JOIN pg_class c ON c.oid = i.indexrelid
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE c.relname = 'ix_cot_weeks_report_date'
+                    ORDER BY array_position(i.indkey::int[], a.attnum::int)
+                """)
+                )
+                .scalars()
+                .all()
+            )
+        assert columns == ["report", "report_date"]
+
+    def test_the_reading_of_a_year(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            connection.execute(
+                text("""
+                    INSERT INTO cot_loads (report, year, file, fetched_at)
+                    VALUES ('legacy', 2027, 'deacot2027.zip', now())
+                """)
+            )
+            row = connection.execute(
+                text("SELECT file, weeks, first_day, last_day FROM cot_loads")
+            ).one()
+            self._clean(connection)
+        assert tuple(row) == ("deacot2027.zip", 0, None, None)
+
+    def test_downgrade_drops_the_tables_and_upgrade_creates_them(self, database_url, engine):
+        tables = ("cot_weeks", "cot_positions", "cot_loads")
+        _alembic(database_url, "downgrade", "024")
+        with engine.connect() as connection:
+            for table in tables:
+                assert (
+                    connection.execute(
+                        text("SELECT to_regclass(:table)"), {"table": table}
+                    ).scalar()
+                    is None
+                )
+            assert connection.execute(text("SELECT to_regclass('yield_curve_points')")).scalar()
+        _alembic(database_url, "upgrade", "head")
+        with engine.connect() as connection:
+            for table in tables:
+                assert connection.execute(
+                    text("SELECT to_regclass(:table)"), {"table": table}
+                ).scalar()
+
+
+class TestCotReportsOnPostgres:
+    """``macro/cot_reports.py`` on the real CFTC files of ``tests/fixtures/cftc/``."""
+
+    NOW = datetime(2026, 10, 18, 9, 0, tzinfo=timezone.utc)
+    FIXTURES = Path(__file__).parent / "fixtures" / "cftc"
+    FILES = {
+        "legacy": {
+            "history": "deacot1986_2016.zip",
+            2025: "deacot2025.zip",
+            2026: "deacot2026.zip",
+        },
+        "tff": {"history": "fin_fut_txt_2006_2016.zip", 2026: "fut_fin_txt_2026.zip"},
+        "disaggregated": {
+            "history": "fut_disagg_txt_hist_2006_2016.zip",
+            2026: "fut_disagg_txt_2026.zip",
+        },
+    }
+
+    @pytest.fixture
+    async def cot(self, database_url, engine):
+        from financials.providers.cftc import REPORTS, CotFile, parse_cot_zip
+        from macro.cot_reports import CotReports
+
+        def clean():
+            with engine.begin() as connection:
+                connection.execute(text("DELETE FROM cot_weeks"))
+                connection.execute(text("DELETE FROM cot_loads"))
+
+        clean()
+        files: dict = {}
+
+        async def read_file(report, year):
+            if (report, year) in files:
+                return files[(report, year)]
+            key = "history" if year <= 2016 else year
+            name = self.FILES[report].get(key)
+            if name is None:
+                return None  # not published (404)
+            return parse_cot_zip((self.FIXTURES / name).read_bytes(), report, year)
+
+        reader = AsyncMock(side_effect=read_file)
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        service = CotReports(async_sessionmaker(async_engine), reader, now=lambda: self.NOW)
+        yield service, reader, files, (REPORTS, CotFile)
+        await async_engine.dispose()
+        clean()
+
+    @staticmethod
+    def asked(reader) -> list:
+        return [call.args for call in reader.await_args_list]
+
+    async def test_a_request_reads_the_years_it_needs(self, cot, engine):
+        service, reader, _, _ = cot
+
+        load = await service.refresh("legacy", 2025)
+
+        assert (load.status, load.years_read, load.years_failed) == ("fetched", [2025, 2026], [])
+        assert (load.first_day, load.last_day) == (date(2025, 1, 7), date(2026, 10, 13))
+        assert load.fetched_at == self.NOW
+        with engine.connect() as connection:
+            counts = connection.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM cot_weeks), (SELECT count(*) FROM cot_positions)"
+                )
+            ).one()
+            loads = connection.execute(
+                text("SELECT year, file, weeks, first_day, last_day FROM cot_loads ORDER BY year")
+            ).all()
+        assert tuple(counts) == (104 + 50, (104 + 50) * 3)
+        assert [tuple(row) for row in loads] == [
+            (2025, "deacot2025.zip", 104, date(2025, 1, 7), date(2025, 12, 30)),
+            (2026, "deacot2026.zip", 50, date(2026, 8, 25), date(2026, 10, 13)),
+        ]
+
+    async def test_the_history_file_holds_every_year_up_to_2016(self, cot, engine):
+        service, reader, _, _ = cot
+
+        load = await service.refresh("legacy", 1990, 1992)
+        again = await service.refresh("legacy", 1986, 2016)
+
+        assert load.years_read == [1990, 1991, 1992]
+        assert again.status == "fresh"  # 1986 to 2016 came with the file: never asked again
+        assert self.asked(reader) == [("legacy", 1990)]
+        with engine.connect() as connection:
+            loads = connection.execute(
+                text("SELECT count(*), min(year), max(year), sum(weeks) FROM cot_loads")
+            ).one()
+            years = (
+                connection.execute(
+                    text("SELECT weeks FROM cot_loads WHERE year IN (1986, 1988) ORDER BY year")
+                )
+                .scalars()
+                .all()
+            )
+        assert tuple(loads) == (31, 1986, 2016, 21)
+        assert years == [4, 0]  # a year of the file without a line of the fixture
+
+    async def test_what_is_read_again(self, cot):
+        service, reader, _, _ = cot
+        await service.refresh("tff", 2026)
+
+        assert (await service.refresh("tff", 2026)).status == "fresh"
+        service.now = lambda: self.NOW + timedelta(hours=24)
+        assert (await service.refresh("tff", 2026)).years_read == [2026]
+        await service.refresh("tff", 2026, force=True)
+        assert self.asked(reader) == [("tff", 2026)] * 3
+
+    async def test_a_year_not_published_yet(self, cot):
+        service, _, _, _ = cot
+        service.now = lambda: datetime(2027, 1, 4, 9, 0, tzinfo=timezone.utc)
+        load = await service.refresh("disaggregated", 2026)
+        assert (load.years_read, load.years_failed) == ([2026], [2027])
+        assert load.reason == "the CFTC did not answer"
+
+    async def test_the_markets_with_their_latest_name(self, cot):
+        service, _, _, _ = cot
+        await service.refresh("legacy", 2016)
+        await service.refresh("legacy", 2025)
+
+        markets = {market.code: market for market in await service.markets("legacy")}
+
+        ten_year = markets["043602"]
+        assert ten_year.name == "UST 10Y NOTE - CHICAGO BOARD OF TRADE"
+        assert (ten_year.first_date, ten_year.last_date) == (date(1986, 1, 15), date(2026, 10, 13))
+        assert ten_year.weeks == 10 + 8
+        assert markets["004603"].weeks == 2
+        assert {m.report for m in await service.markets()} == {"legacy"}
+
+    async def test_the_history_of_a_market(self, cot):
+        from macro.cot_reports import signals
+
+        service, _, _, _ = cot
+        await service.refresh("disaggregated", 2026)
+
+        weeks = await service.history("disaggregated", "067651", start=date(2026, 10, 1))
+
+        assert [w.report_date for w in weeks] == [date(2026, 10, 6), date(2026, 10, 13)]
+        latest = weeks[-1]
+        assert latest.name == "WTI-PHYSICAL - NEW YORK MERCANTILE EXCHANGE"
+        assert list(latest.positions) == [
+            "producer_merchant",
+            "swap_dealer",
+            "managed_money",
+            "other_reportable",
+            "nonreportable",
+        ]
+        managed = latest.positions["managed_money"]
+        assert (managed.long, managed.short, managed.spreading) == (171973, 131399, 286687)
+        assert latest.positions["producer_merchant"].spreading is None
+        signal = signals(weeks, "managed_money", 1)[-1]
+        assert (signal.net, signal.published_on) == (171973 - 131399, date(2026, 10, 16))
+        assert await service.history("disaggregated", "999999") == []
+
+    async def test_a_file_read_again_replaces_its_years(self, cot, engine):
+        service, _, files, (_, cot_file_class) = cot
+        await service.refresh("legacy", 2026)
+        first = await service.read_file("legacy", 2026)
+        kept = tuple(w for w in first.weeks if w.code == "088691")
+        files[("legacy", 2026)] = cot_file_class("legacy", first.file, 2026, 2026, kept)
+
+        await service.refresh("legacy", 2026, force=True)
+
+        with engine.connect() as connection:
+            codes = (
+                connection.execute(text("SELECT DISTINCT market_code FROM cot_weeks"))
+                .scalars()
+                .all()
+            )
+            positions = connection.execute(text("SELECT count(*) FROM cot_positions")).scalar()
+        assert (codes, positions) == (["088691"], 8 * 3)
+
+    async def test_an_empty_file_keeps_the_lines_stored(self, cot, engine):
+        service, _, files, (_, cot_file_class) = cot
+        await service.refresh("legacy", 2026)
+        files[("legacy", 2026)] = cot_file_class("legacy", "deacot2026.zip", 2026, 2026, ())
+
+        load = await service.refresh("legacy", 2026, force=True)
+
+        assert load.status == "failed"
+        assert (
+            load.reason == "the CFTC gave no line in deacot2026.zip; the 50 lines stored are kept"
+        )
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM cot_weeks")).scalar() == 50
+
+    async def test_the_full_history_of_a_report_fits_the_inserts(self, cot, engine):
+        """More lines than one insert takes (4000 rows a statement)."""
+        service, _, files, (_, cot_file_class) = cot
+        from financials.providers.cftc import MarketWeek, Position
+
+        weeks = tuple(
+            MarketWeek(
+                f"{index:06d}",
+                date(2026, 1, 6) + timedelta(days=7 * (index % 40)),
+                f"MARKET {index}",
+                None,
+                10,
+                (
+                    Position("noncommercial", 4, 3, 1),
+                    Position("commercial", 5, 6, None),
+                    Position("nonreportable", 0, 0, None),
+                ),
+            )
+            for index in range(4500)
+        )
+        files[("legacy", 2026)] = cot_file_class("legacy", "deacot2026.zip", 2026, 2026, weeks)
+
+        await service.refresh("legacy", 2026)
+
+        with engine.connect() as connection:
+            counts = connection.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM cot_weeks), (SELECT count(*) FROM cot_positions)"
+                )
+            ).one()
+        assert tuple(counts) == (4500, 13500)
+
+
+class TestCotScriptOnPostgres:
+    """``scripts/load_cot.py`` from the files of the CFTC to the tables."""
+
+    async def test_the_years_read_then_up_to_date_and_a_file_not_published(
+        self, database_url, engine, fake_network, monkeypatch, capsys
+    ):
+        import httpx
+
+        from scripts import load_cot
+
+        fixtures = Path(__file__).parent / "fixtures" / "cftc"
+        for name in ("deacot2025.zip", "deacot2026.zip"):
+            fake_network.get(
+                f"/history/{name}", httpx.Response(200, content=(fixtures / name).read_bytes())
+            )
+        fake_network.get("/history/fut_fin_txt_2025.zip", httpx.Response(404, text="<html></html>"))
+        monkeypatch.delenv("ASYNC_DATABASE_URL", raising=False)
+        monkeypatch.setenv("DATABASE_URL", database_url)
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM cot_weeks"))
+            connection.execute(text("DELETE FROM cot_loads"))
+        argv = ["--report", "legacy", "tff", "--start-year", "2025", "--end-year", "2026"]
+
+        try:
+            first = await load_cot.main(argv)
+            first_output = capsys.readouterr().out
+            second = await load_cot.main(
+                ["--report", "legacy", "--start-year", "2025", "--end-year", "2026"]
+            )
+            second_output = capsys.readouterr().out
+            with engine.connect() as connection:
+                counts = connection.execute(
+                    text(
+                        "SELECT (SELECT count(*) FROM cot_weeks), (SELECT count(*) FROM cot_positions)"
+                    )
+                ).one()
+        finally:
+            with engine.begin() as connection:
+                connection.execute(text("DELETE FROM cot_weeks"))
+                connection.execute(text("DELETE FROM cot_loads"))
+
+        assert (first, second) == (1, 0)
+        assert first_output.splitlines() == [
+            "legacy        fetched  2025-01-07 → 2026-10-13  (2 years read: 2025, 2026)",
+            "tff           failed   nothing stored  (not read: 2025, 2026, the CFTC did not answer)",
+        ]
+        assert tuple(counts) == (154, 154 * 3)
+        # The CFTC did not give the TFF file of 2025: the file of 2026 was not asked.
+        assert fake_network.calls("fut_fin_txt") == 1
+        assert second_output.splitlines()[0].startswith("legacy        fresh")
+        assert fake_network.calls("deacot") == 2

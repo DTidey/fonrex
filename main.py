@@ -45,6 +45,7 @@ from financials.sec_cik import SecCikResolver, SqlCikStore
 from financials.sec_statements import SecStatements
 from financials.service import FinancialsAggregator
 from historical.ingestion_service import HistoricalIngestionService
+from macro.cot_reports import CotReports
 from macro.ecb_service import ECBService
 from macro.eurostat_service import EurostatService
 from macro.fred_service import FREDService
@@ -57,6 +58,7 @@ from realtime.connection_manager import ConnectionManager
 from realtime.worker import RealtimePriceWorker
 from routers.admin import router as admin_router
 from routers.assets import router as assets_router
+from routers.cot import router as cot_router
 from routers.factors import router as factors_router
 from routers.fundamentals import router as fundamentals_router
 from routers.historical import router as historical_router
@@ -118,6 +120,7 @@ app.include_router(fundamentals_router)
 app.include_router(specialized_router)
 app.include_router(realtime_router)
 app.include_router(macro_router)
+app.include_router(cot_router)
 app.include_router(factors_router)
 app.include_router(sec_router)
 
@@ -243,6 +246,7 @@ SPECIALIZED_PROVIDER_SPECS = (
     ("justetf_provider", "JustETF", "financials.providers.justetf", "JustETFProvider"),
     ("openfigi_provider", "OpenFIGI", "financials.providers.openfigi", "OpenFIGIProvider"),
     ("treasury_provider", "Treasury", "financials.providers.treasury", "TreasuryProvider"),
+    ("cftc_provider", "CFTC", "financials.providers.cftc", "CftcProvider"),
     (
         "index_provider",
         "IndexConstituents",
@@ -306,6 +310,7 @@ def configure_application_state(application: FastAPI):
         "ecb_service",
         "eurostat_service",
         "treasury_curves",
+        "cot_reports",
         "sec_statements",
         "sec_check",
         "factor_library",
@@ -451,6 +456,21 @@ async def startup_event(application: FastAPI):
     except Exception as exc:
         state.treasury_curves = None
         logger.warning("⚠️ Treasury yield curves not started: %s", exc)
+
+    try:
+        cftc_provider = getattr(state, "cftc_provider", None)
+        if async_resources and cftc_provider is not None:
+            state.cot_reports = CotReports(
+                async_resources.session_factory, cftc_provider.report_file
+            )
+            logger.info("📊 CFTC Commitments of Traders started")
+        else:
+            logger.warning(
+                "⚠️ DATABASE_URL not set or CFTC unavailable — Commitments of Traders disabled"
+            )
+    except Exception as exc:
+        state.cot_reports = None
+        logger.warning("⚠️ CFTC Commitments of Traders not started: %s", exc)
 
     try:
         sec_provider = getattr(state, "sec_edgar_provider", None)
@@ -607,6 +627,7 @@ async def shutdown_event(application: FastAPI):
         "ecb_service",
         "eurostat_service",
         "treasury_curves",
+        "cot_reports",
         "sec_statements",
         "sec_check",
         "factor_library",
