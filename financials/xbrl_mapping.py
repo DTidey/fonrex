@@ -25,6 +25,7 @@ does not publish (a bank has no operating income) stays ``None``.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -39,6 +40,9 @@ TAXONOMIES = (US_GAAP, IFRS)
 # Forms of the annual reports: domestic (10-K), foreign (20-F), Canadian (40-F), amended.
 ANNUAL_FORMS = frozenset({"10-K", "10-K/A", "10-KT", "20-F", "20-F/A", "40-F", "40-F/A"})
 FISCAL_YEAR_DAYS = (350, 380)
+
+# The accession number of a filing of the SEC: "0000320193-25-000079".
+_ACCESSION = re.compile(r"\d{10}-\d{2}-\d{6}")
 
 MONEY = "money"
 PER_SHARE = "per_share"
@@ -81,7 +85,9 @@ COLUMNS: tuple[Column, ...] = (
             "SalesRevenueNet",
             "RevenuesNetOfInterestExpense",
         ),
-        ("Revenue", "RevenueFromSaleOfGoods"),
+        # IFRS 15 revenue is tagged either way: Airbus and Novo Nordisk use "Revenue",
+        # TotalEnergies and Pernod Ricard "RevenueFromContractsWithCustomers".
+        ("Revenue", "RevenueFromContractsWithCustomers", "RevenueFromSaleOfGoods"),
     ),
     _column("gross_profit", "income", ("GrossProfit",), ("GrossProfit",)),
     _column(
@@ -90,8 +96,13 @@ COLUMNS: tuple[Column, ...] = (
         ("OperatingIncomeLoss",),
         ("ProfitLossFromOperatingActivities",),
     ),
+    # A company without minority interests may tag only the profit of the group
+    # (Novo Nordisk): it is then the profit of the owners of the parent.
     _column(
-        "net_income", "income", ("NetIncomeLoss",), ("ProfitLossAttributableToOwnersOfParent",)
+        "net_income",
+        "income",
+        ("NetIncomeLoss",),
+        ("ProfitLossAttributableToOwnersOfParent", "ProfitLoss"),
     ),
     _column(
         "eps_basic", "income", ("EarningsPerShareBasic",), ("BasicEarningsLossPerShare",), PER_SHARE
@@ -148,7 +159,7 @@ COLUMNS: tuple[Column, ...] = (
         "total_equity",
         "balance",
         ("StockholdersEquity",),
-        ("EquityAttributableToOwnersOfParent",),
+        ("EquityAttributableToOwnersOfParent", "Equity"),
     ),
     _column(
         "cash_and_equivalents",
@@ -368,8 +379,13 @@ class Figure:
     filed: date
 
     @property
-    def filing_url(self) -> str:
-        """The index of the filing on EDGAR."""
+    def filing_url(self) -> str | None:
+        """The index of the filing on EDGAR; ``None`` for a filing that is not the SEC's.
+
+        An ESEF filing (``fxo_id``) has its own links, kept in ``esef_filings``.
+        """
+        if not _ACCESSION.fullmatch(self.accession):
+            return None
         return (
             "https://www.sec.gov/Archives/edgar/data/"
             f"{int(self.accession.split('-')[0])}/{self.accession.replace('-', '')}/"
@@ -383,15 +399,23 @@ class FiscalYear:
     period_end: date
     currency: str
     figures: dict[str, Figure] = field(default_factory=dict)
+    # A figure left out because it is not plausible, and why (ESEF: an error of scale).
+    warnings: list[str] = field(default_factory=list)
 
     def value(self, column: str) -> Decimal | None:
         figure = self.figures.get(column)
         return figure.value if figure else None
 
 
+_CURRENCY = re.compile(r"[A-Z]{3}")
+
+
 def reporting_currency(rows: Iterable[FactRow]) -> str | None:
-    """The currency of the latest annual report: the most frequent money unit it uses."""
-    money = [row for row in rows if "/" not in row.unit and row.unit != "shares"]
+    """The currency of the latest annual report: the most frequent money unit it uses.
+
+    Only a code of ISO 4217 counts: a ratio (``pure``) or a unit of the filer is not money.
+    """
+    money = [row for row in rows if _CURRENCY.fullmatch(row.unit)]
     if not money:
         return None
     last_filed = max(row.order for row in money)

@@ -38,9 +38,11 @@ from database.technical import SqlAlchemyTechnicalRepository
 from documentation import get_api_documentation
 from factors.exposure import FactorExposure
 from factors.store import FactorLibrary
+from financials.esef_lei import LeiResolver, SqlLeiStore
+from financials.esef_statements import EsefStatements
 from financials.providers.sec_edgar import uses_default_contact
 from financials.router import router as financials_router
-from financials.sec_check import SecCheck
+from financials.sec_check import ESEF_NOT_COMPARED, SecCheck
 from financials.sec_cik import SecCikResolver, SqlCikStore
 from financials.sec_statements import SecStatements
 from financials.service import FinancialsAggregator
@@ -59,6 +61,7 @@ from realtime.worker import RealtimePriceWorker
 from routers.admin import router as admin_router
 from routers.assets import router as assets_router
 from routers.cot import router as cot_router
+from routers.esef import router as esef_router
 from routers.factors import router as factors_router
 from routers.fundamentals import router as fundamentals_router
 from routers.historical import router as historical_router
@@ -123,6 +126,7 @@ app.include_router(macro_router)
 app.include_router(cot_router)
 app.include_router(factors_router)
 app.include_router(sec_router)
+app.include_router(esef_router)
 
 app.include_router(monitoring_router)
 app.include_router(openbb_router)
@@ -247,6 +251,7 @@ SPECIALIZED_PROVIDER_SPECS = (
     ("openfigi_provider", "OpenFIGI", "financials.providers.openfigi", "OpenFIGIProvider"),
     ("treasury_provider", "Treasury", "financials.providers.treasury", "TreasuryProvider"),
     ("cftc_provider", "CFTC", "financials.providers.cftc", "CftcProvider"),
+    ("esef_provider", "ESEF", "financials.providers.esef", "EsefProvider"),
     (
         "index_provider",
         "IndexConstituents",
@@ -313,6 +318,8 @@ def configure_application_state(application: FastAPI):
         "cot_reports",
         "sec_statements",
         "sec_check",
+        "esef_statements",
+        "esef_check",
         "factor_library",
         "factor_exposure",
         "validation_layer",
@@ -495,6 +502,26 @@ async def startup_event(application: FastAPI):
         logger.warning("⚠️ SEC statements not started: %s", exc)
 
     try:
+        esef_provider = getattr(state, "esef_provider", None)
+        if async_resources and esef_provider is not None:
+            session_factory = async_resources.session_factory
+            lei_resolver = LeiResolver(SqlLeiStore(session_factory), esef_provider.lei_records)
+            state.esef_statements = EsefStatements(session_factory, esef_provider, lei_resolver)
+            state.esef_check = SecCheck(
+                session_factory,
+                state.esef_statements,
+                filed_with="the ESEF filing",
+                not_compared=ESEF_NOT_COMPARED,
+            )
+            logger.info("🇪🇺 ESEF filings started")
+        else:
+            logger.warning("⚠️ DATABASE_URL not set or ESEF unavailable — ESEF filings disabled")
+    except Exception as exc:
+        state.esef_statements = None
+        state.esef_check = None
+        logger.warning("⚠️ ESEF filings not started: %s", exc)
+
+    try:
         if async_resources:
             state.factor_library = FactorLibrary(async_resources.session_factory)
             state.factor_exposure = FactorExposure(
@@ -630,6 +657,8 @@ async def shutdown_event(application: FastAPI):
         "cot_reports",
         "sec_statements",
         "sec_check",
+        "esef_statements",
+        "esef_check",
         "factor_library",
         "factor_exposure",
         "usage_recorder",

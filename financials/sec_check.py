@@ -61,6 +61,16 @@ NOT_COMPARED = {
     "cash_and_equivalents": "Yahoo may add the short-term investments",
     "total_equity": "Yahoo includes the minority interests",
 }
+# Also defined differently by Yahoo and the European annual reports, as the check of
+# 19 large European companies showed (24 % of agreement against 90 % for the others).
+ESEF_NOT_COMPARED = {
+    **NOT_COMPARED,
+    "operating_income": (
+        "Yahoo computes its own operating income; the reports give their own subtotal"
+    ),
+    "interest_expense": "the reports give their finance costs, of a wider scope",
+    "capex": "Yahoo adds the intangible assets; the reports give the tangible ones",
+}
 YEAR_END_SLACK = 14  # days
 NO_YAHOO_YEAR = (
     "No Yahoo statements for this fiscal year (deep enrichment not run, "
@@ -88,6 +98,7 @@ class FigureCheck:
     difference: Decimal | None = None  # (yahoo - sec) / |sec|, on amounts for payments
     concept: str | None = None
     filing_url: str | None = None
+    accession: str | None = None  # the filing of the figure (an fxo_id for ESEF)
 
 
 @dataclass
@@ -98,6 +109,8 @@ class YearCheck:
     yahoo_currency: str | None = None
     note: str | None = None
     figures: list[FigureCheck] = field(default_factory=list)
+    # What the reading of the filed year found doubtful (a figure left out, and why).
+    warnings: list[str] = field(default_factory=list)
 
     def count(self, status: str) -> int:
         return sum(1 for figure in self.figures if figure.status == status)
@@ -136,7 +149,11 @@ def _compare_figure(
     sec = figure.value if figure else None
     yahoo = _decimal(yahoo_value)
     statement = COLUMNS_BY_NAME[column].statement
-    origin = {"concept": figure.concept, "filing_url": figure.filing_url} if figure else {}
+    origin = (
+        {"concept": figure.concept, "filing_url": figure.filing_url, "accession": figure.accession}
+        if figure
+        else {}
+    )
     if sec is None and yahoo is None:
         return None
     if yahoo is None:
@@ -168,19 +185,25 @@ def compare(
     sec_years: Iterable[SecFiscalYear],
     yahoo_years: Iterable[Any],
     tolerance: Decimal | None = None,
+    *,
+    filed_with: str = "the SEC filing",
+    not_compared: Iterable[str] = (),
 ) -> list[YearCheck]:
     """Check each fiscal year filed with the SEC against the Yahoo year ending with it.
 
     ``yahoo_years`` are fiscal years as ``fiscal_years()`` gives them (one object
     per year, every column). A SEC year without Yahoo year has no figures and a
-    ``note``: the statements of that year were never stored from Yahoo.
+    ``note``: the statements of that year were never stored from Yahoo. The columns
+    of ``not_compared`` are left out.
     """
+    columns = [column for column in COMPARED if column not in set(not_compared)]
     tolerance = check_tolerance() if tolerance is None else tolerance
     yahoo_years = list(yahoo_years)
     used: set[int] = set()
     checks = []
     for sec_year in sec_years:
         check = YearCheck(sec_year.period_end, sec_year.currency)
+        check.warnings = list(getattr(sec_year, "warnings", None) or [])
         yahoo_year = _yahoo_year(sec_year.period_end, yahoo_years, used)
         if yahoo_year is not None:
             check.yahoo_period_end = yahoo_year.period_end
@@ -191,12 +214,12 @@ def compare(
             continue
         if check.yahoo_currency and check.yahoo_currency.upper() != sec_year.currency.upper():
             check.note = (
-                f"Yahoo gives this year in {check.yahoo_currency}, the SEC filing in "
+                f"Yahoo gives this year in {check.yahoo_currency}, {filed_with} in "
                 f"{sec_year.currency}: not compared"
             )
             checks.append(check)
             continue
-        for column in COMPARED:
+        for column in columns:
             yahoo_value = getattr(yahoo_year, column, None)
             result = _compare_figure(column, sec_year, yahoo_value, tolerance)
             if result is not None:
@@ -215,9 +238,21 @@ class SecCheckResult:
 class SecCheck:
     """The check of an instrument: its SEC filings against its stored Yahoo statements."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], statements: Any) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        statements: Any,
+        *,
+        filed_with: str = "the SEC filing",
+        not_compared: dict[str, str] | None = None,
+    ) -> None:
+        """``statements`` gives the annual statements filed (``SecStatements`` or
+        ``EsefStatements``); ``filed_with`` names them in the notes; ``not_compared``
+        the figures left out of the check, and why (``NOT_COMPARED`` by default)."""
         self.session_factory = session_factory
         self.statements = statements
+        self.filed_with = filed_with
+        self.not_compared = dict(NOT_COMPARED if not_compared is None else not_compared)
 
     async def yahoo_years(self, asset_id: int) -> list[Any]:
         """The annual statements stored from Yahoo, by fiscal year (three rows a year)."""
@@ -242,5 +277,13 @@ class SecCheck:
         if not sec_years:
             return SecCheckResult(load, tolerance, [])
         return SecCheckResult(
-            load, tolerance, compare(sec_years, await self.yahoo_years(asset_id), tolerance)
+            load,
+            tolerance,
+            compare(
+                sec_years,
+                await self.yahoo_years(asset_id),
+                tolerance,
+                filed_with=self.filed_with,
+                not_compared=self.not_compared,
+            ),
         )

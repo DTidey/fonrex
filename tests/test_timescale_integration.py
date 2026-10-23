@@ -16,11 +16,13 @@ A temporary database is created next to the one named in the URL and dropped at
 the end; the database of the URL itself is never touched.
 """
 
+import json
 import os
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -1213,6 +1215,82 @@ class TestSecCikOnPostgres:
         assert [tuple(row) for row in rows] == [(88, None, "0001000184", NOT_FOUND, False, True, 1)]
 
 
+class TestEsefLeiOnPostgres:
+    """``financials.esef_lei``: the LEI kept in the ``LEI`` mapping of the instrument."""
+
+    async def test_found_then_reused_then_switched_off(self, database_url, engine):
+        import json
+
+        from financials.esef_lei import FOUND_BY_ISIN, NOT_FOUND, LeiResolver, SqlLeiStore
+        from financials.providers.esef import parse_lei_records
+
+        airbus = parse_lei_records(
+            json.loads(
+                (PROJECT_ROOT / "tests" / "fixtures" / "esef" / "airbus_gleif.json").read_text()
+            )
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO assets (id, ticker, name, currency, is_active, isin, quote_type)
+                    VALUES (91, 'AIR', 'Airbus SE', 'EUR', true, 'NL0000235190', 'EQUITY'),
+                           (92, 'CW8', 'Amundi MSCI World', 'EUR', true, 'LU1681043599', 'ETF');
+                """)
+            )
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        source = AsyncMock(return_value=airbus)
+        resolver = LeiResolver(SqlLeiStore(async_sessionmaker(async_engine)), source)
+        try:
+            found = await resolver.resolve(91)
+            again = await resolver.resolve(91)
+            fund = await resolver.resolve(92)
+            with engine.begin() as connection:
+                stored = connection.execute(
+                    text("""
+                        SELECT provider_ticker, provider_url, source, is_active,
+                               last_verified_at IS NOT NULL
+                        FROM asset_mappings WHERE provider_name = 'LEI' AND asset_id = 91
+                    """)
+                ).one()
+            # A LEI no longer confirmed by GLEIF is switched off.
+            source.return_value = []
+            lost = await resolver.resolve(91, refresh=True)
+            missing = await resolver.resolve(999)
+        finally:
+            await async_engine.dispose()
+
+        assert found.lei == again.lei == "MINO79WLOO247M1IL051"
+        assert found.origin == FOUND_BY_ISIN
+        assert (
+            source.await_count == 2
+        )  # the second reading is the stored LEI; the fund is not asked
+        assert fund.lei is None and missing.lei is None
+        assert tuple(stored) == (
+            "MINO79WLOO247M1IL051",
+            "https://search.gleif.org/#/record/MINO79WLOO247M1IL051",
+            FOUND_BY_ISIN,
+            True,
+            True,
+        )
+        assert lost.lei is None and lost.origin == NOT_FOUND
+        with engine.begin() as connection:
+            rows = connection.execute(
+                text("""
+                    SELECT asset_id, asset_listing_id, provider_ticker, source, is_active,
+                           last_verified_at IS NULL, failure_count
+                    FROM asset_mappings WHERE provider_name = 'LEI' ORDER BY asset_id
+                """)
+            ).all()
+            connection.execute(text("DELETE FROM asset_mappings WHERE asset_id IN (91, 92)"))
+            connection.execute(text("DELETE FROM assets WHERE id IN (91, 92)"))
+        # One row for the instrument (no listing), kept with the last LEI, switched off.
+        assert [tuple(row) for row in rows] == [
+            (91, None, "MINO79WLOO247M1IL051", NOT_FOUND, False, True, 1)
+        ]
+
+
 class TestXbrlFactsOnPostgres:
     """Revision 023: the facts of the XBRL filings of the SEC."""
 
@@ -2021,6 +2099,744 @@ class TestCotTablesOnPostgres:
                 assert connection.execute(
                     text("SELECT to_regclass(:table)"), {"table": table}
                 ).scalar()
+
+
+class TestEsefTablesOnPostgres:
+    """Revision 026: the ESEF filings of European listed companies."""
+
+    LEI = "MINO79WLOO247M1IL051"
+    FILING = text("""
+        INSERT INTO esef_filings (fxo_id, lei, listed_period_end, country, listed_at, report_end)
+        VALUES (:fxo_id, :lei, :listed, 'NL', now(), :report_end)
+    """)
+    # The rule the storage follows: the value of the latest filing is kept.
+    FACT = text("""
+        INSERT INTO esef_facts
+            (lei, taxonomy, concept, unit, period_end, duration_days, period_start, value,
+             decimals, fxo_id, report_end)
+        VALUES (:lei, 'ifrs-full', 'Revenue', 'EUR', DATE '2024-12-31', 366, DATE '2024-01-01',
+                :value, -6, :fxo_id, :report_end)
+        ON CONFLICT (lei, taxonomy, concept, unit, period_end, duration_days)
+        DO UPDATE SET value = EXCLUDED.value, decimals = EXCLUDED.decimals,
+                      fxo_id = EXCLUDED.fxo_id, report_end = EXCLUDED.report_end
+        WHERE EXCLUDED.report_end >= esef_facts.report_end
+    """)
+
+    @staticmethod
+    def _clean(connection):
+        connection.execute(text("DELETE FROM esef_facts"))
+        connection.execute(text("DELETE FROM esef_filings"))
+        connection.execute(text("DELETE FROM esef_entity_loads"))
+
+    def _filing(self, connection, year: int) -> str:
+        fxo_id = f"{self.LEI}-{year}-12-31-ESEF-NL-0"
+        connection.execute(
+            self.FILING,
+            {
+                "fxo_id": fxo_id,
+                "lei": self.LEI,
+                "listed": date(year, 12, 31),
+                "report_end": date(year, 12, 31),
+            },
+        )
+        return fxo_id
+
+    def _revenue(self, connection, fxo_id: str, value: int, year: int) -> None:
+        connection.execute(
+            self.FACT,
+            {"lei": self.LEI, "value": value, "fxo_id": fxo_id, "report_end": date(year, 12, 31)},
+        )
+
+    def _stored(self, connection):
+        return tuple(connection.execute(text("SELECT value, fxo_id FROM esef_facts")).one())
+
+    def test_a_restatement_replaces_the_value_and_an_older_filing_does_not(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            first, restated = self._filing(connection, 2024), self._filing(connection, 2025)
+            self._revenue(connection, first, 69_230_000_000, 2024)
+            self._revenue(connection, restated, 69_300_000_000, 2025)
+            after_restatement = self._stored(connection)
+            self._revenue(connection, first, 69_230_000_000, 2024)
+            after_reading_the_older_again = self._stored(connection)
+            self._clean(connection)
+        assert after_restatement == (Decimal("69300000000.000000"), restated)
+        assert after_reading_the_older_again == after_restatement
+
+    def test_the_values_go_with_their_filing(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            filing = self._filing(connection, 2025)
+            self._revenue(connection, filing, 73_420_000_000, 2025)
+            connection.execute(text("DELETE FROM esef_filings WHERE fxo_id = :f"), {"f": filing})
+            left = connection.execute(text("SELECT count(*) FROM esef_facts")).scalar()
+            self._clean(connection)
+        assert left == 0
+
+    def test_a_value_needs_its_filing(self, engine):
+        with pytest.raises(IntegrityError, match="fk_esef_facts_filing"):
+            with engine.begin() as connection:
+                self._clean(connection)
+                self._revenue(connection, f"{self.LEI}-2025-12-31-ESEF-NL-0", 1, 2025)
+
+    def test_a_reading_status_is_one_of_three(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            filing = self._filing(connection, 2025)
+            for status in ("read", "refused", "missing", None):
+                connection.execute(
+                    text("UPDATE esef_filings SET read_status = :s WHERE fxo_id = :f"),
+                    {"s": status, "f": filing},
+                )
+            row = connection.execute(
+                text("SELECT facts, breakdowns, conflicts, read_at FROM esef_filings")
+            ).one()
+            self._clean(connection)
+        assert tuple(row) == (0, 0, 0, None)
+        with pytest.raises(IntegrityError, match="ck_esef_filings_read_status"):
+            with engine.begin() as connection:
+                filing = self._filing(connection, 2025)
+                connection.execute(
+                    text("UPDATE esef_filings SET read_status = 'done' WHERE fxo_id = :f"),
+                    {"f": filing},
+                )
+
+    def test_the_reading_of_a_company(self, engine):
+        with engine.begin() as connection:
+            self._clean(connection)
+            connection.execute(
+                text("INSERT INTO esef_entity_loads (lei, fetched_at) VALUES (:lei, now())"),
+                {"lei": self.LEI},
+            )
+            row = connection.execute(
+                text("SELECT entity_name, filings, last_report_end, facts FROM esef_entity_loads")
+            ).one()
+            self._clean(connection)
+        assert tuple(row) == (None, 0, None, 0)
+
+    @pytest.mark.parametrize(
+        ("index", "expected"),
+        [("ix_esef_filings_lei", ["lei", "report_end"]), ("ix_esef_facts_fxo_id", ["fxo_id"])],
+    )
+    def test_the_indexes(self, engine, index, expected):
+        with engine.connect() as connection:
+            columns = (
+                connection.execute(
+                    text("""
+                    SELECT a.attname FROM pg_index i
+                    JOIN pg_class c ON c.oid = i.indexrelid
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE c.relname = :index
+                    ORDER BY array_position(i.indkey::int[], a.attnum::int)
+                """),
+                    {"index": index},
+                )
+                .scalars()
+                .all()
+            )
+        assert columns == expected
+
+    def test_downgrade_drops_the_tables_and_upgrade_creates_them(self, database_url, engine):
+        tables = ("esef_filings", "esef_facts", "esef_entity_loads")
+        _alembic(database_url, "downgrade", "025")
+        with engine.connect() as connection:
+            for table in tables:
+                assert (
+                    connection.execute(
+                        text("SELECT to_regclass(:table)"), {"table": table}
+                    ).scalar()
+                    is None
+                )
+            assert connection.execute(text("SELECT to_regclass('cot_weeks')")).scalar()
+        _alembic(database_url, "upgrade", "head")
+        with engine.connect() as connection:
+            for table in tables:
+                assert connection.execute(
+                    text("SELECT to_regclass(:table)"), {"table": table}
+                ).scalar()
+
+
+class _FakeEsef:
+    """filings.xbrl.org answering with the real index and filings of ``tests/fixtures/esef/``.
+
+    A filing of the index without a file among the fixtures is not given (``None``),
+    as when filings.xbrl.org does not answer; ``refuse`` makes a filing unreadable.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures" / "esef"
+
+    def __init__(self, key: str, lei: str):
+        from financials.providers.esef import parse_filings
+
+        self.lei = lei
+        self.listed = list(
+            parse_filings(
+                json.loads((self.FIXTURES / f"{key}_filings.json").read_text()), lei
+            ).filings
+        )
+        self.asked: list[str] = []
+        self.refuse: set[str] = set()
+        self.listing = AsyncMock(side_effect=lambda lei: self.listed)
+
+    async def filings(self, lei):
+        return await self.listing(lei)
+
+    async def report(self, filing):
+        from financials.providers.esef import EsefError, parse_xbrl_json
+
+        self.asked.append(filing.fxo_id)
+        if filing.fxo_id in self.refuse:
+            raise EsefError(f"{filing.fxo_id}: not an xBRL-JSON document")
+        path = self.FIXTURES / f"{filing.fxo_id}.json"
+        if not path.exists():
+            return None
+        return parse_xbrl_json(path.read_bytes(), filing.lei, filing.fxo_id)
+
+
+class TestEsefLongPrefixesOnPostgres:
+    """Revision 027: the prefix of an extension longer than 40 characters."""
+
+    PREFIX = "ecclesiasticalinsuranceofficepubliclimitedcompany"  # 50 characters
+
+    @staticmethod
+    def _lengths(engine):
+        with engine.connect() as connection:
+            return dict(
+                connection.execute(
+                    text("""
+                        SELECT column_name, character_maximum_length
+                        FROM information_schema.columns
+                        WHERE table_name = 'esef_facts' AND column_name IN ('taxonomy', 'unit')
+                    """)
+                ).all()
+            )
+
+    def test_a_long_prefix_is_stored(self, engine):
+        lei = "213800E5HL2O1FU4I690"
+        fxo_id = f"{lei}-2024-12-31-ESEF-GB-0"
+        with engine.begin() as connection:
+            TestEsefTablesOnPostgres._clean(connection)
+            connection.execute(
+                text("""
+                    INSERT INTO esef_filings (fxo_id, lei, listed_at) VALUES (:f, :lei, now());
+                    INSERT INTO esef_facts
+                        (lei, taxonomy, concept, unit, period_end, duration_days, value,
+                         fxo_id, report_end)
+                    VALUES (:lei, :prefix, 'InsuranceServiceResultBeforeReinsuranceContractsHeld',
+                            :unit, DATE '2024-12-31', 366, 1, :f, DATE '2024-12-31');
+                """),
+                {"f": fxo_id, "lei": lei, "prefix": self.PREFIX, "unit": f"GBP/{self.PREFIX}:x"},
+            )
+            stored = connection.execute(text("SELECT taxonomy FROM esef_facts")).scalar_one()
+            TestEsefTablesOnPostgres._clean(connection)
+        assert stored == self.PREFIX
+
+    def test_027_gives_255_characters_and_its_downgrade_40(self, database_url, engine):
+        _alembic(database_url, "downgrade", "026")
+        before = self._lengths(engine)
+        _alembic(database_url, "upgrade", "027")
+        after = self._lengths(engine)
+        _alembic(database_url, "upgrade", "head")
+        assert before == {"taxonomy": 40, "unit": 40}
+        assert after == {"taxonomy": 255, "unit": 255}
+
+
+class TestEsefTextKeysOnPostgres:
+    """Revision 028: the names of the values of an ESEF filing have no length limit."""
+
+    def test_a_concept_longer_than_255_characters_is_stored(self, engine):
+        lei = "529900JEHFM47DYY3S57"
+        fxo_id = f"{lei}-2021-12-31-ESEF-LU-0"
+        concept = "DisclosureOf" + "VeryDetailedInformation" * 15  # 357 characters
+        with engine.begin() as connection:
+            TestEsefTablesOnPostgres._clean(connection)
+            connection.execute(
+                text("""
+                    INSERT INTO esef_filings (fxo_id, lei, listed_at) VALUES (:f, :lei, now());
+                    INSERT INTO esef_facts
+                        (lei, taxonomy, concept, unit, period_end, duration_days, value,
+                         fxo_id, report_end)
+                    VALUES (:lei, 'erf', :concept, :unit, DATE '2021-12-31', 365, 1, :f,
+                            DATE '2021-12-31');
+                """),
+                {"f": fxo_id, "lei": lei, "concept": concept, "unit": "EUR/" + "erf:x" * 60},
+            )
+            stored = connection.execute(text("SELECT length(concept) FROM esef_facts")).scalar()
+            types = dict(
+                connection.execute(
+                    text("""
+                        SELECT column_name, data_type FROM information_schema.columns
+                        WHERE table_name = 'esef_facts'
+                          AND column_name IN ('taxonomy', 'concept', 'unit')
+                    """)
+                ).all()
+            )
+            TestEsefTablesOnPostgres._clean(connection)
+        assert stored == len(concept) == 357
+        assert types == {"taxonomy": "text", "concept": "text", "unit": "text"}
+
+    def test_downgrade_gives_back_255_characters(self, database_url, engine):
+        _alembic(database_url, "downgrade", "027")
+        with engine.connect() as connection:
+            lengths = dict(
+                connection.execute(
+                    text("""
+                        SELECT column_name, character_maximum_length
+                        FROM information_schema.columns
+                        WHERE table_name = 'esef_facts'
+                          AND column_name IN ('taxonomy', 'concept', 'unit')
+                    """)
+                ).all()
+            )
+        _alembic(database_url, "upgrade", "head")
+        assert lengths == {"taxonomy": 255, "concept": 255, "unit": 255}
+
+
+class TestEsefStatementsOnPostgres:
+    """``financials/esef_statements.py`` on the real filings of ``tests/fixtures/esef/``."""
+
+    NOW = datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc)
+    AIRBUS = "MINO79WLOO247M1IL051"
+    PERNOD = "52990097YFPX9J0H5D87"
+    NOVO = "549300DAQ1CVT6CXN342"
+
+    @pytest.fixture
+    async def statements(self, database_url, engine):
+        from financials.esef_lei import FOUND_BY_ISIN, LeiResolution
+        from financials.esef_statements import EsefStatements
+
+        with engine.begin() as connection:
+            TestEsefTablesOnPostgres._clean(connection)
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        clock = {"now": self.NOW}
+
+        def build(key: str, lei: str, name: str):
+            provider = _FakeEsef(key, lei)
+            resolver = MagicMock()
+            resolver.resolve = AsyncMock(
+                return_value=LeiResolution(lei, origin=FOUND_BY_ISIN, legal_name=name)
+            )
+            service = EsefStatements(
+                async_sessionmaker(async_engine), provider, resolver, now=lambda: clock["now"]
+            )
+            return service, provider
+
+        yield build, clock
+        await async_engine.dispose()
+        with engine.begin() as connection:
+            TestEsefTablesOnPostgres._clean(connection)
+
+    def _filings(self, engine):
+        with engine.connect() as connection:
+            return {
+                row.fxo_id[21:]: row
+                for row in connection.execute(
+                    text("""
+                        SELECT fxo_id, read_status, read_reason, report_end, facts,
+                               breakdowns, conflicts, listed_period_end, read_at
+                        FROM esef_filings ORDER BY fxo_id
+                    """)
+                )
+            }
+
+    async def test_airbus_read_stored_and_made_into_annual_statements(self, statements, engine):
+        build, _ = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+
+        load = await service.refresh(1)
+        _, years = await service.annual(1, refresh=False)
+
+        # 2022 to 2024 are listed but their files are not among the fixtures: not given.
+        assert load.status == "failed"
+        assert "2022-12-31-ESEF-NL-0" in load.reason
+        assert [fxo_id[21:] for fxo_id in load.read] == [
+            "2021-12-31-ESEF-NL-0",
+            "2025-12-31-ESEF-NL-0",
+        ]
+        assert (load.entity_name, load.filings, load.last_report_end) == (
+            "AIRBUS SE",
+            5,
+            date(2025, 12, 31),
+        )
+        assert load.facts > 400
+        assert [(y.period_end, y.currency) for y in years] == [
+            (date(2025, 12, 31), "EUR"),
+            (date(2024, 12, 31), "EUR"),
+            (date(2021, 12, 31), "EUR"),
+            (date(2020, 12, 31), "EUR"),
+        ]
+        latest, previous = years[0], years[1]
+        assert latest.value("revenue") == Decimal("73420000000")
+        assert latest.value("net_income") == Decimal("5221000000")
+        assert latest.value("total_assets") == Decimal("134939000000")
+        assert latest.value("eps_diluted") == Decimal("6.6")
+        # The comparative year of the 2025 filing, named after it.
+        assert previous.figures["revenue"].accession == f"{self.AIRBUS}-2025-12-31-ESEF-NL-0"
+        assert previous.figures["revenue"].form == "ESEF"
+
+        rows = self._filings(engine)
+        read = rows["2025-12-31-ESEF-NL-0"]
+        assert (read.read_status, read.report_end, read.facts, read.breakdowns) == (
+            "read",
+            date(2025, 12, 31),
+            269,
+            171,
+        )
+        assert rows["2023-12-31-ESEF-NL-0"].read_status is None
+
+    async def test_a_recent_reading_is_not_asked_again_and_a_later_one_reads_what_was_not_given(
+        self, statements
+    ):
+        build, clock = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        await service.refresh(1)
+        first = list(provider.asked)
+
+        fresh = await service.refresh(1)
+        clock["now"] = self.NOW + timedelta(days=2)
+        provider.asked.clear()
+        later = await service.refresh(1)
+
+        assert fresh.status == "fresh" and provider.listing.await_count == 2
+        assert len(first) == 5
+        # Read once: only the filings never given are asked again.
+        assert [fxo_id[21:] for fxo_id in provider.asked] == [
+            "2022-12-31-ESEF-NL-0",
+            "2023-12-31-ESEF-NL-0",
+            "2024-12-31-ESEF-NL-0",
+        ]
+        assert later.read == ()
+
+    async def test_a_recent_reading_still_reads_a_filing_set_to_be_read_again(
+        self, statements, engine
+    ):
+        build, clock = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        await service.refresh(1)
+        listed_at = self._filings(engine)
+        # The filing of 2021 set to be read again by hand, as after a correction.
+        with engine.begin() as connection:
+            connection.execute(
+                text("""
+                    UPDATE esef_filings
+                    SET read_status = NULL, read_reason = 'a fact of None'
+                    WHERE fxo_id LIKE '%2021-12-31-ESEF-NL-0'
+                """)
+            )
+        clock["now"] = self.NOW + timedelta(hours=1)
+        provider.asked.clear()
+
+        load = await service.refresh(1)
+        again = await service.refresh(1)
+
+        # Read without listing the index again; the filings not given wait for it.
+        assert provider.listing.await_count == 1
+        assert [fxo_id[21:] for fxo_id in provider.asked] == ["2021-12-31-ESEF-NL-0"]
+        assert (load.status, [fxo_id[21:] for fxo_id in load.read]) == (
+            "fetched",
+            ["2021-12-31-ESEF-NL-0"],
+        )
+        assert load.fetched_at == self.NOW and load.filings == 5
+        assert again.status == "fresh"
+        rows = self._filings(engine)
+        assert (
+            rows["2021-12-31-ESEF-NL-0"].read_status,
+            rows["2021-12-31-ESEF-NL-0"].read_reason,
+        ) == (
+            "read",
+            None,
+        )
+        assert rows["2023-12-31-ESEF-NL-0"].read_status is None
+        assert rows["2023-12-31-ESEF-NL-0"].read_reason == "not given by filings.xbrl.org"
+        assert listed_at["2023-12-31-ESEF-NL-0"].read_reason == "not given by filings.xbrl.org"
+
+    async def test_force_reads_every_filing_again(self, statements):
+        build, _ = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        await service.refresh(1)
+        provider.asked.clear()
+        load = await service.refresh(1, force=True)
+        assert len(provider.asked) == 5
+        assert len(load.read) == 2
+
+    async def test_the_period_comes_from_the_facts_and_a_june_fiscal_year(self, statements, engine):
+        build, _ = statements
+        service, _ = build("pernod", self.PERNOD, "PERNOD RICARD")
+        await service.refresh(1)
+        _, years = await service.annual(1, refresh=False)
+
+        listed_december = self._filings(engine)["2021-12-31-ESEF-FR-0"]
+        assert listed_december.listed_period_end == date(2021, 12, 31)
+        assert listed_december.report_end == date(2021, 6, 30)
+        assert years[0].period_end == date(2025, 6, 30)
+        assert years[0].value("revenue") == Decimal("10959000000")
+        assert years[0].figures["revenue"].concept == "RevenueFromContractsWithCustomers"
+        assert date(2021, 6, 30) in [y.period_end for y in years]
+
+    async def test_half_years_are_stored_but_make_no_fiscal_year(self, statements, engine):
+        build, _ = statements
+        service, _ = build("novo", self.NOVO, "NOVO NORDISK A/S")
+        load = await service.refresh(1)
+        _, years = await service.annual(1, refresh=False)
+
+        assert load.last_report_end == date(2026, 6, 30)
+        assert [y.period_end for y in years] == [
+            date(2020, 12, 31),
+            date(2019, 12, 31),
+            date(2018, 12, 31),
+        ]
+        assert years[0].currency == "DKK"
+        # No minority interests: the profit of the group.
+        assert years[0].value("net_income") == Decimal("42138000000")
+        assert years[0].figures["net_income"].concept == "ProfitLoss"
+        assert years[0].value("total_equity") == Decimal("63325000000")
+        with engine.connect() as connection:
+            half_year = connection.execute(
+                text("""
+                    SELECT value FROM esef_facts
+                    WHERE concept = 'Revenue' AND period_end = DATE '2026-06-30'
+                      AND duration_days = 181
+                """)
+            ).scalar_one()
+        assert half_year == Decimal("175311000000")
+
+    async def test_a_refused_filing_and_one_without_file_are_not_asked_again(
+        self, statements, engine
+    ):
+        build, clock = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        refused, missing = (f"{self.AIRBUS}-{year}-12-31-ESEF-NL-0" for year in (2025, 2024))
+        provider.refuse.add(refused)
+        provider.listed = [
+            replace(f, json_url=None) if f.fxo_id == missing else f for f in provider.listed
+        ]
+
+        load = await service.refresh(1)
+        clock["now"] = self.NOW + timedelta(days=2)
+        provider.asked.clear()
+        await service.refresh(1)
+
+        assert load.refused == {refused: f"EsefError: {refused}: not an xBRL-JSON document"}
+        rows = self._filings(engine)
+        assert (
+            rows["2025-12-31-ESEF-NL-0"].read_status,
+            rows["2024-12-31-ESEF-NL-0"].read_status,
+        ) == (
+            "refused",
+            "missing",
+        )
+        assert rows["2025-12-31-ESEF-NL-0"].read_reason.startswith("EsefError:")
+        assert refused not in provider.asked and missing not in provider.asked
+
+        # A new file for the refused filing is read again.
+        provider.refuse.clear()
+        provider.listed = [
+            replace(f, sha256="a new file") if f.fxo_id == refused else f for f in provider.listed
+        ]
+        clock["now"] = self.NOW + timedelta(days=4)
+        load = await service.refresh(1)
+        assert refused in load.read
+
+    async def test_an_index_not_read_keeps_what_was_stored(self, statements):
+        from financials.providers.esef import EsefError
+
+        build, clock = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        await service.refresh(1)
+        clock["now"] = self.NOW + timedelta(days=2)
+        provider.listing.side_effect = None
+        provider.listing.return_value = None
+        not_answered = await service.refresh(1)
+        provider.listing.side_effect = EsefError("filings.xbrl.org: not a JSON:API answer")
+        not_read = await service.refresh(1)
+        _, years = await service.annual(1, refresh=False)
+
+        assert not_answered.status == not_read.status == "failed"
+        assert not_answered.reason == "EsefError: filings.xbrl.org did not answer"
+        assert not_read.reason == "EsefError: filings.xbrl.org: not a JSON:API answer"
+        assert not_read.last_report_end == date(2025, 12, 31)
+        assert len(years) == 4
+
+    async def test_every_filing_given_is_a_complete_reading(self, statements):
+        build, _ = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        provider.listed = [f for f in provider.listed if f.listed_period_end.year in (2021, 2025)]
+        load = await service.refresh(1)
+        assert (load.status, load.reason, len(load.read)) == ("fetched", None, 2)
+
+    async def test_a_filing_without_any_number_is_refused(self, statements, engine):
+        from financials.providers.esef import EsefReport
+
+        build, _ = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        provider.listed = provider.listed[:1]
+        empty = EsefReport(provider.listed[0].fxo_id, self.AIRBUS, (), 12, (), ())
+        provider.report = AsyncMock(return_value=empty)
+        load = await service.refresh(1)
+        row = next(iter(self._filings(engine).values()))
+        assert load.refused == {empty.fxo_id: "no number in the filing"}
+        assert (row.read_status, row.read_reason) == ("refused", "no number in the filing")
+
+    async def test_an_index_never_read(self, statements):
+        build, _ = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        provider.listing.side_effect = None
+        provider.listing.return_value = None
+        load = await service.refresh(1)
+        assert (load.status, load.lei, load.facts) == ("failed", self.AIRBUS, 0)
+
+    async def test_a_company_never_read(self, statements):
+        build, _ = statements
+        service, provider = build("airbus", self.AIRBUS, "AIRBUS SE")
+        load, years = await service.annual(1, refresh=False)
+        assert (load.status, load.lei, load.reason, years) == (
+            "failed",
+            self.AIRBUS,
+            "never read from filings.xbrl.org",
+            [],
+        )
+        provider.listing.assert_not_awaited()
+
+    async def test_the_filings_of_a_company(self, statements):
+        build, _ = statements
+        service, _ = build("airbus", self.AIRBUS, "AIRBUS SE")
+        await service.refresh(1)
+        assert [row.listed_period_end.year for row in await service.filings(self.AIRBUS)] == [
+            2025,
+            2024,
+            2023,
+            2022,
+            2021,
+        ]
+
+
+class TestEsefScriptOnPostgres:
+    """``scripts/load_esef.py`` from GLEIF and filings.xbrl.org to the tables."""
+
+    LEI = "MINO79WLOO247M1IL051"
+
+    async def test_the_shares_of_the_catalogue_read_then_up_to_date(
+        self, database_url, engine, fake_network, monkeypatch, capsys
+    ):
+        import httpx
+
+        from scripts import load_esef
+
+        fixtures = Path(__file__).parent / "fixtures" / "esef"
+
+        def answer(name: str) -> httpx.Response:
+            return httpx.Response(200, content=(fixtures / name).read_bytes())
+
+        fake_network.get("filter%5Bisin%5D=NL0000235190", answer("airbus_gleif.json"))
+        # The ISIN of TotalEnergies under another name in the catalogue: not confirmed.
+        fake_network.get("filter%5Bisin%5D=FR0000120271", answer("total_gleif.json"))
+        fake_network.get(f"/api/entities/{self.LEI}/filings", answer("airbus_filings.json"))
+        fake_network.get(
+            "airbus-2021-12-31-en.json", answer(f"{self.LEI}-2021-12-31-ESEF-NL-0.json")
+        )
+        fake_network.get(
+            f"{self.LEI}-2025-12-31-1-en.json", answer(f"{self.LEI}-2025-12-31-ESEF-NL-0.json")
+        )
+        fake_network.get(f"/{self.LEI}/", httpx.Response(404, text="Not Found"))
+        # The other shares the database holds: unknown to GLEIF.
+        fake_network.get("api.gleif.org", httpx.Response(200, json={"data": []}))
+        monkeypatch.delenv("ASYNC_DATABASE_URL", raising=False)
+        monkeypatch.setenv("DATABASE_URL", database_url)
+        with engine.begin() as connection:
+            TestEsefTablesOnPostgres._clean(connection)
+            connection.execute(
+                text("""
+                    INSERT INTO assets (id, ticker, name, currency, is_active, isin, quote_type)
+                    VALUES (95, 'AIR', 'Airbus SE', 'EUR', true, 'NL0000235190', 'EQUITY'),
+                           (96, 'TOT', 'Total', 'EUR', true, 'FR0000120271', 'EQUITY'),
+                           (97, 'CW8', 'Amundi MSCI World', 'EUR', true, 'LU1681043599', 'ETF'),
+                           (98, 'NOISIN', 'No ISIN SA', 'EUR', true, NULL, 'EQUITY');
+                """)
+            )
+
+        try:
+            first = await load_esef.main([])
+            first_output = capsys.readouterr().out
+            second = await load_esef.main([])
+            second_output = capsys.readouterr().out
+            unknown = await load_esef.main(["--ticker", "NOPE"])
+            unknown_output = capsys.readouterr().out
+            with engine.connect() as connection:
+                stored = connection.execute(
+                    text("""
+                        SELECT (SELECT count(*) FROM esef_filings),
+                               (SELECT count(*) FROM esef_filings WHERE read_status = 'read'),
+                               (SELECT count(*) > 400 FROM esef_facts),
+                               (SELECT provider_ticker FROM asset_mappings
+                                WHERE provider_name = 'LEI' AND asset_id = 95)
+                    """)
+                ).one()
+        finally:
+            with engine.begin() as connection:
+                TestEsefTablesOnPostgres._clean(connection)
+                connection.execute(text("DELETE FROM asset_mappings WHERE provider_name = 'LEI'"))
+                connection.execute(text("DELETE FROM assets WHERE id BETWEEN 95 AND 98"))
+
+        # Airbus: 2022 to 2024 not given (404), so the reading is not complete.
+        assert (first, second, unknown) == (1, 0, 1)
+        lines = {line.split()[0]: line for line in first_output.splitlines()}
+        assert lines["AIR"].startswith(f"AIR            failed    {self.LEI}  5 filings, ")
+        assert "last period 2025-12-31  (2 read)  (not given by filings.xbrl.org:" in lines["AIR"]
+        assert lines["TOT"].startswith(
+            "TOT            no LEI    No GLEIF entity named like 'Total'"
+        )
+        # The ETF and the share without ISIN are not even listed.
+        assert "CW8" not in lines and "NOISIN" not in lines
+        assert first_output.splitlines()[-1].endswith(", 1 failed")
+        assert tuple(stored) == (5, 2, True, self.LEI)
+        # Read less than ESEF_REFRESH_HOURS ago: nothing asked again.
+        second_lines = {line.split()[0]: line for line in second_output.splitlines()}
+        assert second_lines["AIR"].startswith(f"AIR            fresh     {self.LEI}")
+        assert fake_network.calls("filter%5Bisin%5D=NL0000235190") == 1
+        assert fake_network.calls("/api/entities/") == 1
+        assert unknown_output.splitlines() == [
+            "NOPE           unknown   not in the catalogue",
+            "1 shares: 0 read, 0 without LEI, 0 failed, 1 unknown",
+        ]
+
+    async def test_an_error_on_one_share_does_not_stop_the_others(
+        self, database_url, engine, monkeypatch, capsys
+    ):
+        from financials.esef_statements import EsefLoad
+        from scripts import load_esef
+
+        async def refresh(self, asset_id, force=False, *, recheck_lei=False):
+            if asset_id == 95:
+                raise RuntimeError("value too long for type character varying(40)\n[SQL: ...]")
+            return EsefLoad("no_lei", reason="An issuer of JP files no ESEF report")
+
+        monkeypatch.setattr(load_esef.EsefStatements, "refresh", refresh)
+        monkeypatch.delenv("ASYNC_DATABASE_URL", raising=False)
+        monkeypatch.setenv("DATABASE_URL", database_url)
+        with engine.begin() as connection:
+            connection.execute(
+                text("""
+                    INSERT INTO assets (id, ticker, name, currency, is_active, isin, quote_type)
+                    VALUES (95, 'AIR', 'Airbus SE', 'EUR', true, 'NL0000235190', 'EQUITY'),
+                           (96, 'TOYOTA', 'Toyota', 'JPY', true, 'JP3633400001', 'EQUITY');
+                """)
+            )
+        try:
+            code = await load_esef.main([])
+            output = capsys.readouterr().out
+        finally:
+            with engine.begin() as connection:
+                connection.execute(text("DELETE FROM assets WHERE id IN (95, 96)"))
+
+        lines = {line.split()[0]: line for line in output.splitlines()}
+        assert code == 1
+        assert lines["AIR"] == (
+            "AIR            error     RuntimeError: value too long for type character varying(40)"
+        )
+        assert lines["TOYOTA"].startswith("TOYOTA         no LEI    An issuer of JP")
+        assert ", 1 failed" in output.splitlines()[-1]
 
 
 class TestCotReportsOnPostgres:
