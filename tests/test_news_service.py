@@ -258,6 +258,58 @@ class TestZoneBourseNewsProvider:
         assert result.month == 5
         assert result.day == 15
 
+    @pytest.mark.asyncio
+    async def test_uses_shared_zonebourse_session_headers_and_parses_allnews_table(
+        self, monkeypatch
+    ):
+        from financials.providers.ZoneBourse_provider import USER_AGENT_ENV_VAR
+
+        monkeypatch.setenv(USER_AGENT_ENV_VAR, "ZoneBourseCustomUA/2.0")
+        html = """
+        <div id="allNews">
+          <table>
+            <tr>
+              <td><span data-utc-date="2026-10-29T16:35:14+00:00">19 min</span></td>
+              <td><a href="/actualite-bourse/tesla-article-123">Tesla publie ses résultats</a></td>
+              <td><span class="badge" title="Zonebourse.com"></span></td>
+            </tr>
+          </table>
+        </div>
+        """
+        p = self._provider()
+        with patch.object(p, "_get", new_callable=AsyncMock, return_value=html) as mock_get:
+            items = await p.fetch(
+                provider_url="https://www.zonebourse.com/cours/action/TESLA-INC-6344549/"
+            )
+
+        sent_headers = mock_get.call_args.kwargs["headers"]
+        assert sent_headers["User-Agent"] == "ZoneBourseCustomUA/2.0"
+        assert sent_headers["Sec-Fetch-Dest"] == "document"
+        assert sent_headers["Sec-Fetch-Mode"] == "navigate"
+        assert sent_headers["Sec-Fetch-Site"] == "none"
+        # A typed navigation carries no Referer.
+        assert "Referer" not in sent_headers
+        assert len(items) == 1
+        assert items[0].title == "Tesla publie ses résultats"
+        assert items[0].source == "Zonebourse.com"
+        assert items[0].published_at == datetime(2026, 10, 29, 16, 35, 14, tzinfo=timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_provider_url_outside_zonebourse_is_never_fetched(self):
+        p = self._provider()
+        with patch.object(p, "_get", new_callable=AsyncMock, return_value="") as mock_get:
+            items = await p.fetch(provider_url="http://169.254.169.254/cours/action/X-1/")
+
+        assert items == []
+        mock_get.assert_not_called()
+
+    def test_provider_url_on_zonebourse_is_read_in_https(self):
+        p = self._provider()
+
+        url = p._build_url(None, "http://zonebourse.com/cours/action/AIRBUS-SE-4637/", None)
+
+        assert url == "https://www.zonebourse.com/cours/action/AIRBUS-SE-4637/actualites/"
+
 
 # ── NewsService ───────────────────────────────────────────────────────────────
 

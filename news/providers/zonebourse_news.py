@@ -15,6 +15,7 @@ from typing import List, Optional
 from bs4 import BeautifulSoup
 
 from financials.providers.base import BaseFinancialProvider
+from financials.providers.ZoneBourse_provider import ZoneBourseProvider, session_headers
 from schemas.news import RawNewsItem
 
 logger = logging.getLogger(__name__)
@@ -68,12 +69,9 @@ class ZoneBourseNewsProvider(BaseFinancialProvider):
             logger.debug("[zonebourse] Cannot build the URL of %s", ticker)
             return []
 
-        headers = self._get_headers(
-            {
-                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.5",
-                "Referer": self.BASE_URL + "/",
-            }
-        )
+        # A navigation typed in the address bar (``Sec-Fetch-Site: none``) carries no
+        # Referer: sending both would be a combination no browser produces.
+        headers = self._get_headers(session_headers())
 
         html = await self._get(url, headers=headers)
         if not html:
@@ -89,8 +87,10 @@ class ZoneBourseNewsProvider(BaseFinancialProvider):
         provider_url: Optional[str],
         provider_ticker: Optional[str],
     ) -> Optional[str]:
-        if provider_url:
-            base = provider_url.rstrip("/")
+        # Only a quote page of zonebourse.com is followed (same rule as ZoneBourseProvider).
+        page = ZoneBourseProvider.direct_url(provider_url) if provider_url else None
+        if page:
+            base = page.rstrip("/")
             if not base.endswith("/actualites"):
                 base += "/actualites/"
             return base
@@ -115,6 +115,7 @@ class ZoneBourseNewsProvider(BaseFinancialProvider):
             or soup.select("article.news-item")
             or soup.select("div.article-item")
             or soup.select("li.list-news-item")
+            or soup.select("#allNews table tr")
         )
 
         for container in article_containers[:limit]:
@@ -133,17 +134,28 @@ class ZoneBourseNewsProvider(BaseFinancialProvider):
                 continue
 
             # Date
-            date_tag = container.find(["time", "span"], class_=re.compile(r"date|time|publi", re.I))
+            date_tag = container.find(attrs={"data-utc-date": True}) or container.find(
+                ["time", "span"], class_=re.compile(r"date|time|publi", re.I)
+            )
             if date_tag is None:
                 date_tag = container.find("span", class_=re.compile(r"source", re.I))
             published_at = None
             if date_tag:
-                date_str = date_tag.get("datetime") or date_tag.get_text(strip=True)
+                date_str = (
+                    date_tag.get("data-utc-date")
+                    or date_tag.get("datetime")
+                    or date_tag.get_text(strip=True)
+                )
                 published_at = self._parse_zonebourse_date(date_str)
 
             # Source
             source_tag = container.find(class_=re.compile(r"source|provider", re.I))
-            source = source_tag.get_text(strip=True) if source_tag else "ZoneBourse"
+            badge_tag = container.find(class_="badge", attrs={"title": True})
+            source = (
+                source_tag.get_text(strip=True)
+                if source_tag
+                else (badge_tag["title"].strip() if badge_tag else "ZoneBourse")
+            )
 
             items.append(
                 RawNewsItem(
