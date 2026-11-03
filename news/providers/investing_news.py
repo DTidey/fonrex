@@ -4,7 +4,7 @@
 InvestingComNewsProvider — news from Investing.com.
 
 Worldwide coverage, excellent quality.
-Moderate Cloudflare protection — full Chrome headers needed.
+Moderate Cloudflare protection — uses the shared Investing session headers.
 """
 
 import logging
@@ -15,6 +15,7 @@ from typing import List, Optional
 from bs4 import BeautifulSoup
 
 from financials.providers.base import BaseFinancialProvider
+from financials.providers.Investing_provider import equity_page_url, session_headers
 from schemas.news import RawNewsItem
 
 logger = logging.getLogger(__name__)
@@ -41,12 +42,8 @@ class InvestingComNewsProvider(BaseFinancialProvider):
 
         headers = self._get_headers(
             {
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
+                **session_headers(),
                 "Cache-Control": "no-cache",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
             }
         )
 
@@ -68,12 +65,14 @@ class InvestingComNewsProvider(BaseFinancialProvider):
         provider_url: Optional[str],
         provider_ticker: Optional[str],
     ) -> Optional[str]:
-        if provider_url:
-            base = provider_url.rstrip("/").rstrip("-news")
-            return base + "-news"
+        # Only an equity page of investing.com is followed (same rule as InvestingProvider).
+        page = equity_page_url(provider_url) if provider_url else None
+        if page:
+            return page.rstrip("/").removesuffix("-news") + "-news"
         if provider_ticker:
-            slug = provider_ticker.lower().rstrip("/")
-            return f"{self.BASE_URL}/{slug}-news"
+            slug = provider_ticker.strip().lower().rstrip("/").removesuffix("-news")
+            page = equity_page_url(slug) if slug and "/" not in slug else None
+            return page + "-news" if page else None
         return None
 
     # ── parsing ───────────────────────────────────────────────────────────────
@@ -84,14 +83,16 @@ class InvestingComNewsProvider(BaseFinancialProvider):
 
         # Investing.com news article selectors
         article_containers = (
-            soup.select("div.articleItem")
+            soup.select("article[data-test='article-item']")
+            or soup.select("div.articleItem")
             or soup.select("article.news-item")
             or soup.select("div[data-test='news-item']")
             or soup.select("li.js-article-item")
         )
 
         for container in article_containers[:limit]:
-            link_tag = container.find("a", href=True)
+            title_link = container.find("a", attrs={"data-test": "article-title-link"}, href=True)
+            link_tag = title_link or container.find("a", href=True)
             if not link_tag:
                 continue
 
@@ -100,7 +101,9 @@ class InvestingComNewsProvider(BaseFinancialProvider):
                 url = "https://www.investing.com" + url
 
             # Title
-            title_tag = container.find(class_=re.compile(r"title|headline", re.I)) or link_tag
+            title_tag = (
+                title_link or container.find(class_=re.compile(r"title|headline", re.I)) or link_tag
+            )
             title = title_tag.get_text(strip=True)
             if not title or len(title) < 5:
                 continue
@@ -120,8 +123,8 @@ class InvestingComNewsProvider(BaseFinancialProvider):
 
             # Source
             source_tag = container.find(
-                class_=re.compile(r"source|publisher|provider|details", re.I)
-            )
+                attrs={"data-test": "news-provider-name"}
+            ) or container.find(class_=re.compile(r"source|publisher|provider|details", re.I))
             source = source_tag.get_text(strip=True) if source_tag else "Investing.com"
 
             # Thumbnail
