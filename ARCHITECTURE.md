@@ -1036,20 +1036,29 @@ docker compose exec fonrex-api python scripts/clean_listing_duplicates.py \
 ```
 
 - A duplicate without prices is deleted; its `asset_mappings` rows go with it (cascade).
-- A duplicate that holds prices is listed in the report and left alone: `prices_eod.asset_listing_id` does not cascade. Prices are checked again right before each delete, with the listing row locked, so the script can run while the scheduler ingests: a duplicate that received prices in the meantime is reported, not deleted.
+- A trusted Yahoo mapping of the duplicate (verified, or set by hand, the rule of `is_trusted_symbol()` in `historical/yahoo_symbols.py`) goes to the kept listing when that one has none, or only an untrusted one (symbol not found, switched off). The duplicate is often the former primary listing, the one that was ingested: without its symbol the kept listing would not be ingested (rule 13 of `AGENTS.md`), and a symbol set by hand would be lost.
+- Without `--move-prices`, a duplicate that holds prices is listed in the report and left alone: `prices_eod.asset_listing_id` does not cascade. Prices are checked again right before each delete, with the listing row locked, so the script can run while the scheduler ingests: a duplicate that received prices in the meantime is reported, not deleted.
 - When the deleted duplicate was the primary listing, the kept listing becomes primary.
 
-A duplicate usually holds prices because it was a primary listing of its instrument (older imports could give an instrument several): the ingestion fetched them for the same instrument and currency as the kept listing. The report says whether the kept listing has prices. If it has none, move the bars to it, then run the script again:
+A duplicate usually holds prices because it was a primary listing of its instrument (older imports could give an instrument several): the ingestion fetched them for the same instrument and currency as the kept listing. The report says whether the kept listing has prices. `--move-prices` hands them to the kept listing, then deletes the duplicate:
 
-```sql
-UPDATE prices_eod SET asset_listing_id = <kept_id> WHERE asset_listing_id = <duplicate_id>;
+```bash
+# Rehearsal first: the report gives the bars moved and dropped per listing
+docker compose exec fonrex-api python scripts/clean_listing_duplicates.py --move-prices --dry-run
+docker compose exec fonrex-api python scripts/clean_listing_duplicates.py --move-prices
 ```
 
-If the kept listing has its own prices, the bars of the duplicate are a second copy of the same series: delete them (`DELETE FROM prices_eod WHERE asset_listing_id = <duplicate_id>`) and run the script again. Doing this inside the script is left to a follow-up.
+- Each series (resolution) of the duplicate is checked on its own. When the kept listing holds bars at that resolution, the two series must agree on every shared session (close within 1 %; a close missing on one side only is a difference, so a bar without close never wins over one with a close; a session without close on both sides compares nothing and does not count as shared), and enough sessions must be compared: five (`MIN_SHARED_SESSIONS`) as soon as the duplicate series holds more bars than that, so that one matching bar never carries thousands of bars nobody compared, however short the kept series is; a duplicate series of five bars or fewer needs as many compared sessions as the shorter of the two series holds, whatever their dates, so one whose bars fall outside the kept series' dates compares nothing and is reported rather than moved, even when the kept listing has a trusted Yahoo symbol.
+- When the kept listing holds no bar at a resolution, nothing can be compared. That series moves only if the kept listing ends up with a trusted Yahoo symbol (its own, or the one handed over): the kept listing is then ingested, and the series is fetched again in full and replaced. Without one, bars fetched before rule 13 with a guessed ticker would become the kept listing's prices for good, so the duplicate is reported instead.
+- All or nothing: if one series of a duplicate fails, nothing moves and the duplicate is reported with the comparison of each resolution (sessions compared, required and different). It may hold another instrument's series, fetched with a symbol that was not verified. Check it by hand before deleting its bars.
+- Otherwise the bars whose `(resolution, time)` the kept listing does not have are copied to it, then every bar of the duplicate is deleted. On a shared session the kept bar stays, and only the fields it lacks (`open`, `high`, `low`, `adj_close`, `volume`) are taken from the duplicate's bar (`INSERT … SELECT … ON CONFLICT DO UPDATE SET field = coalesce(kept, duplicate)`, only where a field is missing). The bars are copied rather than updated in place because the listing is part of the key and of the compression segments of `prices_eod`. The counts of the report come from one aggregate over the duplicate's bars and the `rowcount` of the delete, so nothing else is counted while both listings are locked.
+- The closes are only compared within 1 %, and a dividend changes `adj_close` alone: the moved bars and fields may follow another adjustment basis than the kept ones. So each series of the kept listing that receives bars or fields loses its `price_series_adjustments` row, and the next ingestion fetches it again in full, on one basis (see `historical/adjustment.py`). When the kept listing had no bars, the row of the duplicate goes with it (cascade) and the same full fetch follows.
+- Both listings are locked during the move, so an ingestion that writes either series waits for the end of the run. An ingestion that read the kept series before the lock may still record its adjustment scheme after the commit, on a series that holds moved bars: pause the scheduler while `--move-prices` runs.
+- After the commit, the script refreshes `prices_weekly` and `prices_monthly` on the range of each duplicate's bars, dropped ones included, one refresh per range (overlapping ranges merged): two duplicates from 1995 and 2025 do not refresh the thirty years between them. A refresh cannot run inside a transaction. If that refresh fails, the cleanup stays committed and the daily job of the aggregates catches up.
 
 ## EOD And Historical Data
 
-The `prices_eod` table (TimescaleDB hypertable) is the single source of end-of-day prices: every route reads it, and only the ingestion service writes it.
+The `prices_eod` table (TimescaleDB hypertable) is the single source of end-of-day prices: every route reads it, and only the ingestion service writes it (apart from `scripts/clean_listing_duplicates.py --move-prices`, which hands the bars of a duplicate listing to the kept one).
 
 ### Historical Data Paths
 
