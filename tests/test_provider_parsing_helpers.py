@@ -305,6 +305,135 @@ class TestMarketwatchKeyData:
         assert m.currency == "EUR"
         assert m.dividend_rate == pytest.approx(1.1)
 
+    def test_range_and_sibling_fallback_and_dylan_edge_cases(self):
+        from financials.models import FinancialMetrics
+
+        html = page(
+            '<ul class="list list--kv">'
+            '<li class="kv__item"><small class="label">52 Week Range</small>'
+            '<span class="primary">N/A</span></li>'
+            "</ul>"
+            "<div><span>P/E Ratio</span><span>18.5</span></div>"
+            "<div>Market Cap: $1.58T</div>"
+            "<div>Ex-Dividend Date: Nov 5, 2026</div>"
+            "<div>" + ("x" * 60) + "</div>"
+        )
+        provider = MarketwatchProvider()
+        metrics = provider._parse_page(html, "TST")
+        assert metrics.pe_ratio == pytest.approx(18.5)
+        assert metrics.market_cap == pytest.approx(1.58e12)
+        assert getattr(metrics, "dividend_rate", None) is None
+        assert getattr(metrics, "week_52_low", None) is None
+        assert provider._find_value_by_label(html, ["Dividend"]) is None
+
+        assert provider.extract_entitlement_token("") is None
+        assert provider.extract_entitlement_token("<html>no token</html>") is None
+
+        m = FinancialMetrics(ticker="TST")
+        provider.read_dylan_quote(m, {})
+        provider.read_dylan_quote(m, {"InstrumentResponses": [{}]})
+        provider.read_dylan_quote(
+            m,
+            {
+                "InstrumentResponses": [
+                    {
+                        "Matches": [
+                            {
+                                "Trading": {"Last": {"Price": {"Iso": "EUR", "Value": 12.34}}},
+                                "Financials": {
+                                    "LastDividendPerShare": {"Iso": "EUR", "Value": 0.25},
+                                },
+                                "TradingStatistics": {
+                                    "PriceStatistics": [
+                                        {"Range": {"Duration": {"ValueString": "P50D"}}},
+                                    ],
+                                    "VolumeStatistics": [
+                                        {"Range": {"Duration": {"ValueString": "P50D"}}},
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+        assert m.price == pytest.approx(12.34)
+        assert m.currency == "EUR"
+        assert getattr(m, "dividend_rate", None) is None
+
+        provider.read_dylan_quote(
+            m,
+            {
+                "InstrumentResponses": [
+                    {
+                        "Matches": [
+                            {
+                                "Financials": {
+                                    "AnnualizedDividend": {"Iso": "EUR", "Value": 1.00},
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+        assert m.dividend_rate == pytest.approx(1.00)
+
+    @pytest.mark.parametrize(
+        "annualized", [{"Iso": "USD", "Value": 0}, 0], ids=["nested", "scalar"]
+    )
+    def test_dylan_keeps_an_explicit_zero_dividend(self, annualized):
+        from financials.models import FinancialMetrics
+
+        metrics = FinancialMetrics(ticker="TST")
+        MarketwatchProvider.read_dylan_quote(
+            metrics,
+            {
+                "InstrumentResponses": [
+                    {"Matches": [{"Financials": {"AnnualizedDividend": annualized}}]}
+                ]
+            },
+        )
+
+        assert metrics.dividend_rate == 0.0
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ({"RequestId": "stock/us/xnas/tsla"}, True),
+            ({"RequestId": "STOCK/US/XNAS/AAPL"}, False),
+            ({"Matches": [{"Instrument": {"Ticker": "TSLA"}}]}, True),
+            ({"Matches": [{"Instrument": {"Ticker": "AAPL"}}]}, False),
+            ({"Matches": []}, False),
+            (None, False),
+        ],
+        ids=["request-id", "other-request-id", "ticker", "other-ticker", "no-match", "empty"],
+    )
+    def test_dylan_answer_must_be_for_the_requested_instrument(self, response, expected):
+        from financials.providers.Marketwatch_provider import _dylan_answers_for
+
+        data = {"InstrumentResponses": [response] if response is not None else []}
+        assert _dylan_answers_for(data, "STOCK/US/XNAS/TSLA") is expected
+
+    def test_isin_query_never_falls_back_to_another_instrument(self):
+        other = {
+            "ticker": "FR:XYZ",
+            "country": "FR",
+            "exchangeIsoCode": "XPAR",
+            "isin": "FR0000000001",
+            "type": "Stock",
+            "score": 1.0,
+        }
+        no_isin = {"ticker": "FR:ABC", "country": "FR", "type": "Stock", "score": 0.9}
+        exact = {**other, "ticker": "FR:MC", "isin": "FR0000121014", "score": 0.1}
+
+        assert MarketwatchProvider._select_symbol(
+            {"symbols": [other, no_isin]}, "FR0000121014"
+        ) is None
+        assert MarketwatchProvider._select_symbol(
+            {"symbols": [other, no_isin, exact]}, "fr0000121014"
+        ) == exact
+
 
 class TestBoursoramaHelpers:
     @pytest.mark.parametrize(
