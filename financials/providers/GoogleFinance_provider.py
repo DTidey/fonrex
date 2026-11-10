@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 import re
@@ -7,6 +8,7 @@ from typing import Optional
 import httpx
 from selectolax.parser import HTMLParser, Node
 
+from financials.exchange import GOOGLE_EXCHANGES as ALL_GOOGLE_EXCHANGES
 from financials.models import FinancialMetrics
 from financials.numbers import parse_number
 from financials.providers.base import BaseProvider, ProviderSession
@@ -33,10 +35,17 @@ class GoogleFinanceProvider(BaseProvider):
     - User-Agent rotation
     - Retries with exponential backoff
     - Automatic Ticker Conversion (Yahoo -> Google)
+    - ISIN resolution through the search service of the site
     """
 
     BASE_URL = "https://www.google.com/finance"
     QUOTE_URL = "https://www.google.com/finance/quote/{ticker}"
+    # Search service called by the search box of the site (RPC "XB3kn").
+    SEARCH_RPC_ID = "XB3kn"
+    SEARCH_URL = "https://www.google.com/finance/_/FinHubUi/data/batchexecute?rpcids=XB3kn&hl=en"
+    ISIN_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
+    # Over-the-counter places: kept only when an ISIN has no listing on a regulated market.
+    OTC_EXCHANGES = frozenset({"OTC", "OTCMKTS", "PINK"})
 
     # Yahoo suffix to Google Exchange mapping
     # Sourced from legacy ToolsBox.py and GoogleFinance.py
@@ -120,25 +129,20 @@ class GoogleFinanceProvider(BaseProvider):
                     except Exception:
                         logger.warning(f"Could not extract ticker from URL {ticker}, using as is.")
 
-                # 2. Normalize ticker (AIR.PA -> AIR:EPA)
-                # If it was a URL, we assume the ticker is already in Google format (Symbol:Exchange)
-                if is_url and ":" in ticker:
-                    google_ticker = ticker
-                elif ":" in ticker:
-                    # If we already have a colon, we assume it is EXCHANGE:SYMBOL or SYMBOL:EXCHANGE
-                    # We let _normalize_ticker handle the swap if necessary for the URL
-                    google_ticker = ticker
-                else:
-                    # Otherwise we use the new centralized logic
-                    # We pass the raw ticker, the exchange will be deduced or default
-                    google_ticker = ticker
-
-                # Final normalisation of the URL (SYMBOL:EXCHANGE)
+                # 2. Normalize ticker (AIR.PA -> AIR:EPA, EPA:AIR -> AIR:EPA)
+                is_isin = not is_url and self._is_isin(ticker)
                 if is_url and ":" in ticker:
                     # A quote URL already carries SYMBOL:EXCHANGE: it must not be swapped.
-                    url_ticker = google_ticker
+                    url_ticker = ticker
+                elif is_isin:
+                    # An ISIN is resolved to the SYMBOL:EXCHANGE of its main listing.
+                    resolved = await self._search_by_isin(client, ticker)
+                    if not resolved:
+                        logger.warning(f"No Google Finance listing found for ISIN {ticker}")
+                        return None
+                    url_ticker = resolved
                 else:
-                    url_ticker = self._normalize_ticker(google_ticker)
+                    url_ticker = self._normalize_ticker(ticker)
 
                 # 3. Build URL
                 url = self.QUOTE_URL.format(ticker=url_ticker)
@@ -148,7 +152,7 @@ class GoogleFinanceProvider(BaseProvider):
 
                 # 4. Fallback for US Stocks (Discovery Mode)
                 # If failed (None) and it's a plain ticker (no dot/colon), it might be NYSE/AMEX etc.
-                if not html and "." not in ticker and ":" not in ticker:
+                if not html and not is_isin and "." not in ticker and ":" not in ticker:
                     # We defaulted to NASDAQ in get_google_ticker. Now try others.
                     # Common US prefixes/suffixes for Google Finance
                     fallbacks = ["NYSE", "NYSEAMERICAN", "NYSEARCA", "OTCMKTS"]
@@ -174,6 +178,9 @@ class GoogleFinanceProvider(BaseProvider):
                 metrics = self._parse_page(html, ticker)
                 if metrics:
                     metrics.provider_url = url
+                    if is_isin:
+                        # The listing was found from this ISIN.
+                        metrics.isin = ticker.strip().upper()
 
                     # Fix Ticker format: User wants "HKG:0700" (Exchange:Symbol)
                     # The URL contains "SYMBOL:EXCHANGE" (e.g. 0700:HKG)
@@ -232,20 +239,132 @@ class GoogleFinanceProvider(BaseProvider):
         # Legacy logic calls for Exchange:Symbol
         return f"NASDAQ:{symbol}"
 
+    def _exchange_rank(self, code: str) -> int:
+        """How surely ``code`` is a Google Finance exchange code.
+
+        2: a stock exchange of this provider (EPA, NASDAQ…); 1: another code of the
+        complete list of ``financials/exchange.py`` (SWX, KRX, but also ICE, CURRENCY…);
+        0: not an exchange code, so a symbol.
+        """
+        code = code.strip().upper()
+        if code in self.GOOGLE_EXCHANGES or code in self.YAHOO_TO_GOOGLE_CODE.values():
+            return 2
+        return 1 if code in ALL_GOOGLE_EXCHANGES else 0
+
     def _normalize_ticker(self, ticker: str) -> str:
         """
         Converts inputs for URL usage: 'SYMBOL:EXCHANGE'.
-        Uses get_google_ticker to get 'EXCHANGE:SYMBOL' first, then swaps.
+
+        - 'ACA:EPA' (already SYMBOL:EXCHANGE) is kept as is;
+        - 'EPA:ACA' (EXCHANGE:SYMBOL) is swapped to 'ACA:EPA';
+        - 'ACA.PA' and plain tickers go through get_google_ticker, then are swapped.
+
+        The side that looks more like an exchange is the exchange: 'ICE:NYSE' is kept
+        (ICE is also a code of the list, but NYSE is a stock exchange). When both sides
+        are exchange codes of the same rank, the input is read EXCHANGE:SYMBOL, the format
+        of get_google_ticker and of the catalogue. When neither side is a known exchange
+        ('AIR:XX'), nothing proves the order, so the SYMBOL:EXCHANGE input is kept, like
+        'AIR.XX' gives 'AIR:XX'.
         """
-        # Get Exchange:Symbol (e.g. EPA:AIR)
-        google_ticker_fmt = self.get_google_ticker(ticker)
+        if ":" in ticker:
+            left, right = (part.strip() for part in ticker.split(":", 1))
+            left_rank, right_rank = self._exchange_rank(left), self._exchange_rank(right)
+            if left_rank > right_rank or left_rank == right_rank > 0:
+                return f"{right}:{left}"
+            return f"{left}:{right}"
 
-        if ":" in google_ticker_fmt:
-            parts = google_ticker_fmt.split(":")
-            # Swap to Symbol:Exchange (AIR:EPA) for URL
-            return f"{parts[1]}:{parts[0]}"
+        # Get Exchange:Symbol (e.g. EPA:AIR), then swap to Symbol:Exchange (AIR:EPA)
+        exchange, symbol = self.get_google_ticker(ticker).split(":", 1)
+        return f"{symbol}:{exchange}"
 
-        return google_ticker_fmt
+    @classmethod
+    def _is_isin(cls, value: str) -> bool:
+        return bool(cls.ISIN_PATTERN.match(value.strip().upper()))
+
+    async def _search_by_isin(self, client: ProviderSession, isin: str) -> Optional[str]:
+        """Resolve an ISIN to the SYMBOL:EXCHANGE of its listing (e.g. 'ACA:EPA')."""
+        isin = isin.strip().upper()
+        request = json.dumps([[[self.SEARCH_RPC_ID, json.dumps([isin, None, 1]), None, "generic"]]])
+
+        def headers() -> dict:
+            return {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+
+        try:
+            response = await client.post(self.SEARCH_URL, headers=headers, data={"f.req": request})
+        except Exception as e:
+            logger.warning(f"Network error searching ISIN {isin} on Google Finance: {e}")
+            return None
+
+        if response.status_code != 200:
+            logger.warning(f"Error {response.status_code} searching ISIN {isin} on Google Finance")
+            return None
+
+        return self._pick_listing(self._parse_search_listings(response.text), isin)
+
+    @classmethod
+    def _parse_search_listings(cls, text: str) -> list[dict]:
+        """Listings of a search answer: [{"symbol", "exchange", "country"}], in Google's order.
+
+        The answer starts with the guard ``)]}\'``, then holds JSON lines (with the length
+        of each chunk in between when the answer is chunked). The entry
+        ``["wrb.fr", "XB3kn", "<json>", ...]`` carries the results as a JSON string, each
+        result holding the quote ``[id, [SYMBOL, EXCHANGE], name, _, currency, ..., country]``.
+        """
+        payload = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("["):
+                continue
+            try:
+                chunk = json.loads(line)
+            except ValueError:
+                continue
+            for entry in chunk if isinstance(chunk, list) else []:
+                if (
+                    isinstance(entry, list)
+                    and len(entry) > 2
+                    and entry[:2] == ["wrb.fr", cls.SEARCH_RPC_ID]
+                    and isinstance(entry[2], str)
+                ):
+                    payload = entry[2]
+        if payload is None:
+            return []
+
+        try:
+            results = json.loads(payload)
+            results = results[0] if results else []
+        except (ValueError, IndexError, TypeError):
+            return []
+
+        listings = []
+        for result in results or []:
+            try:
+                quote = result[3]
+                symbol, exchange = quote[1][0], quote[1][1]
+                country = quote[9] if len(quote) > 9 else None
+            except (IndexError, TypeError):
+                continue
+            if isinstance(symbol, str) and isinstance(exchange, str) and symbol and exchange:
+                listings.append({"symbol": symbol, "exchange": exchange, "country": country})
+        return listings
+
+    @classmethod
+    def _pick_listing(cls, listings: list[dict], isin: str) -> Optional[str]:
+        """Choose the listing of an ISIN: a regulated market first, then the ISIN's country.
+
+        Without a listing in the country of the ISIN (an NL ISIN listed in Paris), the
+        first regulated listing in Google's order is kept.
+        """
+        regulated = [item for item in listings if item["exchange"].upper() not in cls.OTC_EXCHANGES]
+        candidates = regulated or listings
+        if not candidates:
+            return None
+        country = isin[:2].upper()
+        chosen = next((item for item in candidates if item["country"] == country), candidates[0])
+        return f"{chosen['symbol']}:{chosen['exchange']}"
 
     async def _fetch_page(self, client: ProviderSession, url: str) -> Optional[HTMLParser]:
         """Fetches the page content and returns a parser."""
