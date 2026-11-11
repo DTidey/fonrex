@@ -18,6 +18,8 @@ import pandas as pd
 import yfinance as yf
 
 from concurrency import run_sync
+from database.assets import ProfileMetadataRefused
+from database.isin import clean_yahoo_isin
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,10 @@ def _safe_date(value):
 NO_INFO = "Yahoo returned no info"
 
 
+class _StepSkipped(Exception):
+    """Raised by a step that stored nothing on purpose: its reason goes to ``skipped``."""
+
+
 def _load_info(t) -> dict:
     """``t.info`` read once; ``{}`` when Yahoo gives nothing usable.
 
@@ -131,18 +137,6 @@ def _statements_currency(info: dict) -> str | None:
     if isinstance(value, str) and len(value.strip()) == 3 and value.strip().isalpha():
         return value.strip().upper()
     return None
-
-
-# What Yahoo writes in an ISIN field when it has none.
-_NO_ISIN = ("-", "N/A", "NA", "NONE", "NULL")
-
-
-def clean_yahoo_isin(value) -> str | None:
-    """An ISIN given by Yahoo, upper case; ``None`` for an empty field or a placeholder."""
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().upper()
-    return normalized if normalized and normalized not in _NO_ISIN else None
 
 
 def profile_metadata(info: dict) -> dict:
@@ -249,10 +243,15 @@ class YFinanceEnricher:
             )
 
         outcomes = dict(zip(operations, results, strict=True))
+        skipped.update(
+            {name: str(r) for name, r in outcomes.items() if isinstance(r, _StepSkipped)}
+        )
         summary = {
             name: name in outcomes and not isinstance(outcomes[name], Exception) for name in steps
         }
-        summary["errors"] = [str(r) for r in results if isinstance(r, Exception)]
+        summary["errors"] = [
+            str(r) for r in results if isinstance(r, Exception) and not isinstance(r, _StepSkipped)
+        ]
         summary["skipped"] = skipped
 
         # Compute the solvency ratios when the statements and highlights succeeded
@@ -306,12 +305,25 @@ class YFinanceEnricher:
         The same write as the profile enrichment of ``/fundamental``: existing
         values are kept, and metadata of another instrument (ISIN, quote type) is
         refused there. The symbol was verified for ``listing_id`` by the caller
-        (``import_assets.enrich_after_import``), so that listing receives Yahoo's
-        exchange and currency when it has none.
+        (``import_assets.enrich_after_import``, ``/fundamental/deep``), so that
+        listing receives Yahoo's exchange and currency when it has none.
+
+        Nothing left to fill is a success. Metadata of another instrument is
+        reported as skipped, with the check that refused it; a database error
+        is raised, and reported in ``errors``.
         """
-        self.db_service.update_asset_profile_from_metadata(
-            asset_id, profile_metadata(info), listing_id, symbol_verified=listing_id is not None
-        )
+        try:
+            self.db_service.update_asset_profile_from_metadata(
+                asset_id,
+                profile_metadata(info),
+                listing_id,
+                symbol_verified=listing_id is not None,
+                strict=True,
+            )
+        except ProfileMetadataRefused as refused:
+            raise _StepSkipped(
+                f"Yahoo info belongs to another instrument ({refused.reason})"
+            ) from refused
 
     # ------------------------------------------------------------------
     # Highlights (Yahoo's info)

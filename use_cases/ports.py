@@ -68,6 +68,7 @@ class AssetProfileRepositoryPort(FundamentalsRepositoryPort, Protocol):
         listing_id: object = None,
         *,
         symbol_verified: bool = False,
+        strict: bool = False,
     ) -> bool: ...
 
 

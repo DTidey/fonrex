@@ -16,13 +16,13 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from database.assets import AssetRepository
+from database.isin import clean_yahoo_isin
 from financials.enrichment.yfinance_enricher import (
     YFinanceEnricher,
     _load_info,
     _safe_date,
     _to_decimal,
     _to_int,
-    clean_yahoo_isin,
     profile_metadata,
 )
 from models import (
@@ -676,6 +676,7 @@ class TestEnrich(_DatabaseTestCase):
         asset.display_name = "Airbus (catalogue)"
         session.commit()
         session.close()
+        return repository
 
     @patch("financials.enrichment.yfinance_enricher.yf.Ticker")
     def test_profile_is_stored_for_the_verified_listing(self, mock_yf_ticker_class):
@@ -716,12 +717,75 @@ class TestEnrich(_DatabaseTestCase):
         mock_ticker.info.update({"symbol": "AIR.PA", "sector": "Utilities", "isin": "FR0000000000"})
         mock_yf_ticker_class.return_value = mock_ticker
 
-        asyncio.run(self.enricher.enrich(1, "AIR.PA", 10))
+        result = asyncio.run(self.enricher.enrich(1, "AIR.PA", 10))
 
+        self.assertFalse(result["profile"])
+        self.assertEqual(
+            result["skipped"],
+            {"profile": "Yahoo info belongs to another instrument (ISIN mismatch)"},
+        )
+        self.assertEqual(result["errors"], [])
+        self.assertTrue(result["highlights"])  # the other steps still run
         session = self.Session()
         self.assertIsNone(session.get(Asset, 1).sector)
         self.assertEqual(session.get(AssetListing, 10).exchange, "")
         session.close()
+
+    @patch("financials.enrichment.yfinance_enricher.yf.Ticker")
+    def test_profile_of_another_quote_type_names_the_check(self, mock_yf_ticker_class):
+        self._store_profiles()
+        session = self.Session()
+        session.get(Asset, 1).quote_type = "EQUITY"
+        session.commit()
+        session.close()
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.info.update({"symbol": "AIR.PA", "quoteType": "ETF", "sector": "Utilities"})
+        mock_yf_ticker_class.return_value = mock_ticker
+
+        result = asyncio.run(self.enricher.enrich(1, "AIR.PA", 10))
+
+        self.assertFalse(result["profile"])
+        self.assertEqual(
+            result["skipped"]["profile"],
+            "Yahoo info belongs to another instrument (quote type mismatch)",
+        )
+
+    @patch("financials.enrichment.yfinance_enricher.yf.Ticker")
+    def test_profile_with_nothing_left_to_fill_is_a_success(self, mock_yf_ticker_class):
+        self._store_profiles()
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.info.update(
+            {"symbol": "AIR.PA", "exchange": "PAR", "currency": "EUR", "sector": "Industrials"}
+        )
+        mock_yf_ticker_class.return_value = mock_ticker
+        asyncio.run(self.enricher.enrich(1, "AIR.PA", 10))
+
+        # The second run finds every field it could fill already filled.
+        result = asyncio.run(self.enricher.enrich(1, "AIR.PA", 10))
+
+        self.assertTrue(result["profile"])
+        self.assertNotIn("profile", result["skipped"])
+        self.assertEqual(result["errors"], [])
+
+    @patch("financials.enrichment.yfinance_enricher.yf.Ticker")
+    def test_profile_database_error_is_reported(self, mock_yf_ticker_class):
+        from sqlalchemy.exc import OperationalError
+
+        repository = self._store_profiles()
+        broken = MagicMock()
+        broken.get.side_effect = OperationalError("SELECT", {}, Exception("database is locked"))
+        repository.get_session = lambda: broken
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.info.update({"symbol": "AIR.PA", "sector": "Industrials"})
+        mock_yf_ticker_class.return_value = mock_ticker
+
+        result = asyncio.run(self.enricher.enrich(1, "AIR.PA", 10))
+
+        self.assertFalse(result["profile"])
+        self.assertNotIn("profile", result["skipped"])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("database is locked", result["errors"][0])
+        broken.rollback.assert_called_once()
 
     @patch("financials.enrichment.yfinance_enricher.yf.Ticker")
     def test_empty_info_is_reported_as_skipped(self, mock_yf_ticker_class):

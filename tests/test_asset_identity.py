@@ -285,6 +285,42 @@ class AssetIdentityTest(unittest.TestCase):
         self.assertIsNone(details["display_name"])
         self.assertIsNone(details["sector"])
 
+    def test_metadata_mismatch_names_the_check(self):
+        stock = Asset(ticker="AIR", isin="NL0000235190", quote_type="EQUITY")
+        cases = {
+            "same ISIN": ({"isin": " nl0000235190 ", "quoteType": "EQUITY"}, None),
+            "other ISIN": ({"isin": "FR0000000000"}, "ISIN mismatch"),
+            "other quote type": ({"quote_type": "ETF"}, "quote type mismatch"),
+            "unranked quote type": ({"quoteType": "MUTUALFUND"}, None),
+        }
+        # What Yahoo writes when it has no ISIN is no ISIN (clean_yahoo_isin).
+        for placeholder in ("-", "N/A", "na", "None", "NULL", "", None, 42):
+            cases[f"placeholder {placeholder!r}"] = ({"isin": placeholder}, None)
+        for name, (metadata, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.db.assets._metadata_mismatch(stock, metadata), expected)
+                self.assertEqual(
+                    self.db._metadata_is_compatible_with_asset(stock, metadata), expected is None
+                )
+
+    def test_strict_refusal_raises_the_reason(self):
+        from database.assets import ProfileMetadataRefused
+
+        session = self.db.get_session()
+        try:
+            asset = Asset(ticker="AIR", isin="NL0000235190", name="Airbus")
+            session.add(asset)
+            session.commit()
+            asset_id = asset.id
+        finally:
+            session.close()
+        metadata = {"isin": "FR0000000000", "sector": "Utilities"}
+
+        self.assertFalse(self.db.update_asset_profile_from_metadata(asset_id, metadata))
+        with self.assertRaises(ProfileMetadataRefused) as refused:
+            self.db.update_asset_profile_from_metadata(asset_id, metadata, strict=True)
+        self.assertEqual(refused.exception.reason, "ISIN mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()

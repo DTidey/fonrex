@@ -218,6 +218,7 @@ The use-case layer is therefore the target model, reached by three routers; the 
 | `database/migrations.py` | Read-only verification of the current revision against the Alembic head. |
 | `database/component.py` | Shared foundation giving components short and explicit access to synchronous sessions. |
 | `database/price_series.py` | The one rule that turns a ticker into a price series (instrument + listing), and the session-date convention of `prices_eod.time`. Used by the API paths that read or write a price series (ingestion, history, EOD, technical indicators, canary price ranges); the Zipline bundle ranks listings with its own query. |
+| `database/isin.py` | `clean_yahoo_isin`: the ISIN field of a Yahoo answer, `None` for a placeholder (`-`, `N/A`…). Shared by the enrichment, the import and the profile write, which refuses metadata whose ISIN is another instrument's. |
 | `database/ticker_suffix.py` | The places named by Yahoo suffixes (`.PA`, `.DE`, `.L`…): exchange codes and currencies. A ticker looked up without its suffix designates a listing on that place only. |
 | `database/query.py` | Async queries for the history of a listing from `prices_eod` or the `prices_weekly` / `prices_monthly` aggregates. |
 | `database/schemas.py` | Internal Pydantic schemas for database entities (e.g., `PriceEOD`). |

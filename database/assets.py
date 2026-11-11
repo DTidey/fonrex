@@ -7,11 +7,24 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import joinedload
 
 from database.component import DatabaseComponent
+from database.isin import clean_yahoo_isin
 from database.price_series import session_date
 from database.ticker_suffix import listing_on, ticker_lookups
 from models import Asset, AssetListing, IngestLog, PriceEOD, UsageLog
 
 logger = logging.getLogger(__name__)
+
+
+class ProfileMetadataRefused(Exception):
+    """Provider metadata describes another instrument than the asset.
+
+    Raised by ``update_asset_profile_from_metadata`` with ``strict``; ``reason``
+    names the check that failed (``"ISIN mismatch"``, ``"quote type mismatch"``).
+    """
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class AssetRepository(DatabaseComponent):
@@ -245,13 +258,16 @@ class AssetRepository(DatabaseComponent):
 
     @classmethod
     def _metadata_is_compatible_with_asset(cls, asset, metadata):
+        return cls._metadata_mismatch(asset, metadata) is None
+
+    @classmethod
+    def _metadata_mismatch(cls, asset, metadata):
+        """Why the metadata describes another instrument than ``asset``; ``None`` if it may not."""
         asset_isin = cls._normalize_ticker(getattr(asset, "isin", None))
-        metadata_isin = cls._normalize_ticker(metadata.get("isin"))
-        if metadata_isin in ("-", "N/A", "NA", "NONE", "NULL"):
-            metadata_isin = None
+        metadata_isin = clean_yahoo_isin(metadata.get("isin"))
 
         if asset_isin and metadata_isin and asset_isin != metadata_isin:
-            return False
+            return "ISIN mismatch"
 
         asset_quote_type = cls._normalize_ticker(getattr(asset, "quote_type", None))
         metadata_quote_type = cls._normalize_ticker(
@@ -261,12 +277,12 @@ class AssetRepository(DatabaseComponent):
         metadata_rank = cls._quote_type_rank(metadata_quote_type)
 
         if asset_rank in (0, 1) and metadata_rank in (0, 1) and asset_rank != metadata_rank:
-            return False
+            return "quote type mismatch"
 
-        return True
+        return None
 
     def update_asset_profile_from_metadata(
-        self, asset_id, metadata, listing_id=None, *, symbol_verified=False
+        self, asset_id, metadata, listing_id=None, *, symbol_verified=False, strict=False
     ):
         """
         Fill the missing asset/listing fields from provider metadata.
@@ -277,6 +293,11 @@ class AssetRepository(DatabaseComponent):
         symbol verified for ``listing_id`` (``historical/yahoo_symbols.py``): that
         listing receives them, even when its ticker is not Yahoo's (``SPFF`` and
         ``SPFF.DE``).
+
+        Returns whether something was written; ``False`` also when the metadata
+        is refused or the write fails. With ``strict``, a refusal raises
+        ``ProfileMetadataRefused`` and a database error is raised, so that a
+        caller can tell them from "nothing left to fill".
         """
         if not asset_id or not metadata:
             return False
@@ -287,10 +308,14 @@ class AssetRepository(DatabaseComponent):
             if not asset:
                 return False
 
-            if not self._metadata_is_compatible_with_asset(asset, metadata):
+            mismatch = self._metadata_mismatch(asset, metadata)
+            if mismatch:
                 logger.info(
                     f"Profile enrichment skipped: metadata does not match asset_id={asset_id}"
+                    f" ({mismatch})"
                 )
+                if strict:
+                    raise ProfileMetadataRefused(mismatch)
                 return False
 
             listing = session.get(AssetListing, listing_id) if listing_id else None
@@ -372,6 +397,8 @@ class AssetRepository(DatabaseComponent):
         except SQLAlchemyError as e:
             session.rollback()
             logger.warning(f"Asset profile enrichment skipped for asset_id={asset_id}: {e}")
+            if strict:
+                raise
             return False
         finally:
             session.close()

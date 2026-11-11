@@ -670,7 +670,8 @@ def fetch_yfinance_data(ticker: str, isin: Optional[str] = None) -> Optional[Dic
     The fields read from ``info`` are the ones the deep enrichment stores
     (``profile_metadata``); the search fills those ``info`` lacks.
     """
-    from financials.enrichment.yfinance_enricher import clean_yahoo_isin, profile_metadata
+    from database.isin import clean_yahoo_isin
+    from financials.enrichment.yfinance_enricher import profile_metadata
 
     if not ticker:
         return None
