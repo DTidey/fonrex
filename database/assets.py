@@ -292,7 +292,8 @@ class AssetRepository(DatabaseComponent):
         the metadata. With ``symbol_verified``, the metadata was fetched with the
         symbol verified for ``listing_id`` (``historical/yahoo_symbols.py``): that
         listing receives them, even when its ticker is not Yahoo's (``SPFF`` and
-        ``SPFF.DE``).
+        ``SPFF.DE``). A ``listing_id`` that is not a listing of ``asset_id`` is
+        ignored, and no listing is changed.
 
         Returns whether something was written; ``False`` also when the metadata
         is refused or the write fails. With ``strict``, a refusal raises
@@ -318,7 +319,18 @@ class AssetRepository(DatabaseComponent):
                     raise ProfileMetadataRefused(mismatch)
                 return False
 
-            listing = session.get(AssetListing, listing_id) if listing_id else None
+            listing = None
+            if listing_id:
+                listing = (
+                    session.query(AssetListing)
+                    .filter(AssetListing.id == listing_id, AssetListing.asset_id == asset.id)
+                    .one_or_none()
+                )
+                if listing is None:
+                    logger.warning(
+                        f"Profile enrichment: listing_id={listing_id} is not a listing of"
+                        f" asset_id={asset_id}, no listing is changed"
+                    )
 
             field_values = {
                 "name": self._first_present(
@@ -368,6 +380,7 @@ class AssetRepository(DatabaseComponent):
             target_listing = listing
             if (
                 metadata_symbol
+                and not (listing_id and listing is None)
                 and not (symbol_verified and listing)
                 and (
                     not listing

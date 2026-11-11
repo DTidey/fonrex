@@ -321,6 +321,40 @@ class AssetIdentityTest(unittest.TestCase):
             self.db.update_asset_profile_from_metadata(asset_id, metadata, strict=True)
         self.assertEqual(refused.exception.reason, "ISIN mismatch")
 
+    def test_listing_of_another_asset_is_never_changed(self):
+        session = self.db.get_session()
+        try:
+            airbus = Asset(ticker="AIR", isin="NL0000235190", name="Airbus")
+            other = Asset(ticker="SPFF", isin="IE000AQ7A2X6", name="Other fund")
+            session.add_all([airbus, other])
+            session.flush()
+            own = AssetListing(asset_id=airbus.id, ticker="AIR.PA", exchange="", currency="")
+            foreign = AssetListing(asset_id=other.id, ticker="SPFF", exchange="", currency="")
+            session.add_all([own, foreign])
+            session.commit()
+            airbus_id, own_id, foreign_id = airbus.id, own.id, foreign.id
+        finally:
+            session.close()
+
+        updated = self.db.update_asset_profile_from_metadata(
+            airbus_id,
+            {"symbol": "AIR.PA", "exchange": "PAR", "currency": "EUR", "sector": "Industrials"},
+            foreign_id,
+            symbol_verified=True,
+        )
+
+        self.assertTrue(updated)  # the profile of the asset is still filled
+        session = self.db.get_session()
+        try:
+            self.assertEqual(session.get(Asset, airbus_id).sector, "Industrials")
+            foreign = session.get(AssetListing, foreign_id)
+            self.assertEqual((foreign.exchange, foreign.currency), ("", ""))
+            # Nor is the listing found by Yahoo's symbol: the caller named another one.
+            own = session.get(AssetListing, own_id)
+            self.assertEqual((own.exchange, own.currency), ("", ""))
+        finally:
+            session.close()
+
 
 if __name__ == "__main__":
     unittest.main()
