@@ -18,6 +18,8 @@ import pandas as pd
 import yfinance as yf
 
 from concurrency import run_sync
+from database.assets import ProfileMetadataRefused
+from database.isin import clean_yahoo_isin
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,10 @@ def _safe_date(value):
 NO_INFO = "Yahoo returned no info"
 
 
+class _StepSkipped(Exception):
+    """Raised by a step that stored nothing on purpose: its reason goes to ``skipped``."""
+
+
 def _load_info(t) -> dict:
     """``t.info`` read once; ``{}`` when Yahoo gives nothing usable.
 
@@ -133,6 +139,46 @@ def _statements_currency(info: dict) -> str | None:
     return None
 
 
+def profile_metadata(info: dict) -> dict:
+    """The profile of an instrument in Yahoo's info, in the shape of profile metadata.
+
+    Pure: it reads the dict and asks nothing. ``update_asset_profile_from_metadata``
+    writes the result. Used by the deep enrichment and by
+    ``import_assets.fetch_yfinance_data`` (the profile enrichment of ``/fundamental``),
+    which completes it with Yahoo's search. ``{}`` for an empty info.
+    """
+    if not info:
+        return {}
+    return {
+        "name": info.get("shortName") or info.get("longName"),
+        "display_name": info.get("longName") or info.get("shortName"),
+        "official_symbol": info.get("symbol"),
+        "symbol": info.get("symbol"),
+        "exchange": info.get("exchange"),
+        "currency": info.get("currency"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+        "description": info.get("longBusinessSummary"),
+        "long_business_summary": info.get("longBusinessSummary"),
+        "website": info.get("website"),
+        "ir_website": info.get("irWebsite") or info.get("website"),
+        "country": info.get("country"),
+        "quote_type": info.get("quoteType"),
+        "fund_family": info.get("fundFamily"),
+        "isin": clean_yahoo_isin(info.get("isin")),
+        "profile": {
+            "country": info.get("country"),
+            "city": info.get("city"),
+            "fullTimeEmployees": info.get("fullTimeEmployees"),
+            "auditRisk": info.get("auditRisk"),
+            "boardRisk": info.get("boardRisk"),
+            "compensationRisk": info.get("compensationRisk"),
+            "shareHolderRightsRisk": info.get("shareHolderRightsRisk"),
+            "overallRisk": info.get("overallRisk"),
+        },
+    }
+
+
 class YFinanceEnricher:
     """
     Enriches an asset with the deep fundamentals of yfinance.
@@ -146,13 +192,18 @@ class YFinanceEnricher:
         """
         self.db_service = db_service
 
-    async def enrich(self, asset_id: int, ticker: str) -> dict:
-        """Main entry point — runs every enrichment."""
+    async def enrich(self, asset_id: int, ticker: str, listing_id: int | None = None) -> dict:
+        """Main entry point — runs every enrichment.
+
+        ``listing_id`` is the listing ``ticker`` was verified for: the profile step
+        fills its blank exchange and currency.
+        """
         async with _yfinance_semaphore:
             yf_ticker = await run_sync(yf.Ticker, ticker)
         info = await run_sync(_load_info, yf_ticker)
 
         steps = {
+            "profile": (self._store_profile, info, listing_id),
             "highlights": (self._fetch_highlights, info),
             "statements": (self._fetch_statements, yf_ticker, info),
             "earnings": (self._fetch_earnings, yf_ticker),
@@ -165,7 +216,12 @@ class YFinanceEnricher:
         # A step that stores nothing is reported as skipped, not as a success.
         skipped = {}
         if not info:
-            skipped = {"highlights": NO_INFO, "gics": NO_INFO, "statements_currency": NO_INFO}
+            skipped = {
+                "profile": NO_INFO,
+                "highlights": NO_INFO,
+                "gics": NO_INFO,
+                "statements_currency": NO_INFO,
+            }
         operations = {name: step for name, step in steps.items() if name not in skipped}
 
         # SQLite's StaticPool shares one connection across threads and cannot
@@ -187,10 +243,15 @@ class YFinanceEnricher:
             )
 
         outcomes = dict(zip(operations, results, strict=True))
+        skipped.update(
+            {name: str(r) for name, r in outcomes.items() if isinstance(r, _StepSkipped)}
+        )
         summary = {
             name: name in outcomes and not isinstance(outcomes[name], Exception) for name in steps
         }
-        summary["errors"] = [str(r) for r in results if isinstance(r, Exception)]
+        summary["errors"] = [
+            str(r) for r in results if isinstance(r, Exception) and not isinstance(r, _StepSkipped)
+        ]
         summary["skipped"] = skipped
 
         # Compute the solvency ratios when the statements and highlights succeeded
@@ -233,6 +294,36 @@ class YFinanceEnricher:
             return session.get_bind().dialect.name == "sqlite"
         finally:
             session.close()
+
+    # ------------------------------------------------------------------
+    # Profile (Yahoo's info)
+    # ------------------------------------------------------------------
+
+    def _store_profile(self, asset_id: int, info: dict, listing_id: int | None) -> None:
+        """Fill the blank profile fields of the asset (and of its listing) from Yahoo's info.
+
+        The same write as the profile enrichment of ``/fundamental``: existing
+        values are kept, and metadata of another instrument (ISIN, quote type) is
+        refused there. The symbol was verified for ``listing_id`` by the caller
+        (``import_assets.enrich_after_import``, ``/fundamental/deep``), so that
+        listing receives Yahoo's exchange and currency when it has none.
+
+        Nothing left to fill is a success. Metadata of another instrument is
+        reported as skipped, with the check that refused it; a database error
+        is raised, and reported in ``errors``.
+        """
+        try:
+            self.db_service.update_asset_profile_from_metadata(
+                asset_id,
+                profile_metadata(info),
+                listing_id,
+                symbol_verified=listing_id is not None,
+                strict=True,
+            )
+        except ProfileMetadataRefused as refused:
+            raise _StepSkipped(
+                f"Yahoo info belongs to another instrument ({refused.reason})"
+            ) from refused
 
     # ------------------------------------------------------------------
     # Highlights (Yahoo's info)

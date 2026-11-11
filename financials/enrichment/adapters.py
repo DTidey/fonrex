@@ -72,8 +72,11 @@ class YFinanceDeepFundamentalsEnricher:
     def __init__(self, database: FundamentalsRepositoryPort) -> None:
         self._delegate = YFinanceEnricher(database)
 
-    async def enrich(self, asset_id: int, ticker: str) -> FundamentalPayload:
-        return await self._delegate.enrich(asset_id, ticker)
+    async def enrich(
+        self, asset_id: int, ticker: str, listing_id: int | None = None
+    ) -> FundamentalPayload:
+        """``listing_id`` is the listing ``ticker`` was verified for, or ``None``."""
+        return await self._delegate.enrich(asset_id, ticker, listing_id)
 
 
 def normalize_google_finance_ticker(ticker: str) -> str:

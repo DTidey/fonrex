@@ -66,6 +66,9 @@ class AssetProfileRepositoryPort(FundamentalsRepositoryPort, Protocol):
         asset_id: object,
         metadata: Mapping[str, object],
         listing_id: object = None,
+        *,
+        symbol_verified: bool = False,
+        strict: bool = False,
     ) -> bool: ...
 
 
@@ -132,7 +135,9 @@ class SourceSymbolResolverPort(Protocol):
 
 
 class DeepFundamentalsEnricherPort(Protocol):
-    async def enrich(self, asset_id: int, ticker: str) -> FundamentalPayload: ...
+    async def enrich(
+        self, asset_id: int, ticker: str, listing_id: int | None = None
+    ) -> FundamentalPayload: ...
 
 
 class SecEdgarProviderPort(Protocol):

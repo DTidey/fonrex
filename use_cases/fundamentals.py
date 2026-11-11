@@ -449,7 +449,15 @@ class GetDeepFundamentals:
                 self.symbols, asset_profile, resolved_ticker, refresh=refresh
             )
             if yahoo_symbol:
-                enrich_result = await self.enricher.enrich(asset_id, yahoo_symbol)
+                # The listing the symbol was verified for, which receives Yahoo's
+                # exchange and currency when blank. Without a resolver the ticker
+                # is used as typed: it is verified for no listing.
+                verified_listing_id = (
+                    asset_profile.get("listing_id") if self.symbols is not None else None
+                )
+                enrich_result = await self.enricher.enrich(
+                    asset_id, yahoo_symbol, listing_id=verified_listing_id
+                )
                 logger.info("Deep enrichment of %s: %s", yahoo_symbol, enrich_result)
             else:
                 logger.warning("Deep fundamentals not refreshed: %s", yahoo_refusal)

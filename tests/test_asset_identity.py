@@ -285,6 +285,76 @@ class AssetIdentityTest(unittest.TestCase):
         self.assertIsNone(details["display_name"])
         self.assertIsNone(details["sector"])
 
+    def test_metadata_mismatch_names_the_check(self):
+        stock = Asset(ticker="AIR", isin="NL0000235190", quote_type="EQUITY")
+        cases = {
+            "same ISIN": ({"isin": " nl0000235190 ", "quoteType": "EQUITY"}, None),
+            "other ISIN": ({"isin": "FR0000000000"}, "ISIN mismatch"),
+            "other quote type": ({"quote_type": "ETF"}, "quote type mismatch"),
+            "unranked quote type": ({"quoteType": "MUTUALFUND"}, None),
+        }
+        # What Yahoo writes when it has no ISIN is no ISIN (clean_yahoo_isin).
+        for placeholder in ("-", "N/A", "na", "None", "NULL", "", None, 42):
+            cases[f"placeholder {placeholder!r}"] = ({"isin": placeholder}, None)
+        for name, (metadata, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.db.assets._metadata_mismatch(stock, metadata), expected)
+                self.assertEqual(
+                    self.db._metadata_is_compatible_with_asset(stock, metadata), expected is None
+                )
+
+    def test_strict_refusal_raises_the_reason(self):
+        from database.assets import ProfileMetadataRefused
+
+        session = self.db.get_session()
+        try:
+            asset = Asset(ticker="AIR", isin="NL0000235190", name="Airbus")
+            session.add(asset)
+            session.commit()
+            asset_id = asset.id
+        finally:
+            session.close()
+        metadata = {"isin": "FR0000000000", "sector": "Utilities"}
+
+        self.assertFalse(self.db.update_asset_profile_from_metadata(asset_id, metadata))
+        with self.assertRaises(ProfileMetadataRefused) as refused:
+            self.db.update_asset_profile_from_metadata(asset_id, metadata, strict=True)
+        self.assertEqual(refused.exception.reason, "ISIN mismatch")
+
+    def test_listing_of_another_asset_is_never_changed(self):
+        session = self.db.get_session()
+        try:
+            airbus = Asset(ticker="AIR", isin="NL0000235190", name="Airbus")
+            other = Asset(ticker="SPFF", isin="IE000AQ7A2X6", name="Other fund")
+            session.add_all([airbus, other])
+            session.flush()
+            own = AssetListing(asset_id=airbus.id, ticker="AIR.PA", exchange="", currency="")
+            foreign = AssetListing(asset_id=other.id, ticker="SPFF", exchange="", currency="")
+            session.add_all([own, foreign])
+            session.commit()
+            airbus_id, own_id, foreign_id = airbus.id, own.id, foreign.id
+        finally:
+            session.close()
+
+        updated = self.db.update_asset_profile_from_metadata(
+            airbus_id,
+            {"symbol": "AIR.PA", "exchange": "PAR", "currency": "EUR", "sector": "Industrials"},
+            foreign_id,
+            symbol_verified=True,
+        )
+
+        self.assertTrue(updated)  # the profile of the asset is still filled
+        session = self.db.get_session()
+        try:
+            self.assertEqual(session.get(Asset, airbus_id).sector, "Industrials")
+            foreign = session.get(AssetListing, foreign_id)
+            self.assertEqual((foreign.exchange, foreign.currency), ("", ""))
+            # Nor is the listing found by Yahoo's symbol: the caller named another one.
+            own = session.get(AssetListing, own_id)
+            self.assertEqual((own.exchange, own.currency), ("", ""))
+        finally:
+            session.close()
+
 
 if __name__ == "__main__":
     unittest.main()
