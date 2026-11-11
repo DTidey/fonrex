@@ -355,7 +355,8 @@ async def test_deep_fundamentals_are_fetched_with_the_verified_symbol():
     ).execute(ticker="SPFF", refresh=True)
 
     symbols.resolve.assert_awaited_once_with(5, refresh=True)
-    enricher.enrich.assert_awaited_once_with(3, "SPFF.DE")
+    # The listing the symbol was verified for reaches the profile step.
+    enricher.enrich.assert_awaited_once_with(3, "SPFF.DE", listing_id=5)
     assert result["meta"]["symbol"] == "SPFF.DE"
     assert "note" not in result["meta"]
 
@@ -430,7 +431,8 @@ async def test_deep_fundamentals_uses_repository_and_enricher_ports():
 
     assert result["highlights"] == {"market_cap": 123}
     assert result["asset_profile"]["ticker"] == "AAPL"
-    enricher.enrich.assert_awaited_once_with(42, "AAPL")
+    # No resolver: the ticker is asked as typed and verified for no listing.
+    enricher.enrich.assert_awaited_once_with(42, "AAPL", listing_id=None)
     # Every section is read (and cached); the request receives the ones it asked for.
     database.get_deep_sections.assert_called_once_with(42, set(), True)
 

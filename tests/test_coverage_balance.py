@@ -225,7 +225,10 @@ async def test_deep_enricher_delegates_to_yfinance_service():
         enricher_type.return_value.enrich = AsyncMock(return_value={"ok": True})
         adapter = YFinanceDeepFundamentalsEnricher(MagicMock())
         assert await adapter.enrich(1, "AAPL") == {"ok": True}
-        enricher_type.return_value.enrich.assert_awaited_once_with(1, "AAPL")
+        enricher_type.return_value.enrich.assert_awaited_once_with(1, "AAPL", None)
+        # The listing the symbol was verified for is passed on to the profile step.
+        assert await adapter.enrich(3, "SPFF.DE", 5) == {"ok": True}
+        enricher_type.return_value.enrich.assert_awaited_with(3, "SPFF.DE", 5)
 
 
 def _cache(*, cached: object = None) -> SimpleNamespace:

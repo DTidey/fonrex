@@ -135,7 +135,9 @@ class SourceSymbolResolverPort(Protocol):
 
 
 class DeepFundamentalsEnricherPort(Protocol):
-    async def enrich(self, asset_id: int, ticker: str) -> FundamentalPayload: ...
+    async def enrich(
+        self, asset_id: int, ticker: str, listing_id: int | None = None
+    ) -> FundamentalPayload: ...
 
 
 class SecEdgarProviderPort(Protocol):
