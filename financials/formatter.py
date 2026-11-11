@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from financials.numbers import find_number, parse_number
 from monitoring.units import percent_fields
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,21 @@ def _is_number(value: Any) -> bool:
 def _percent_to_ratio(value: Any) -> float:
     """1.45 (percent) -> 0.0145, without the noise of a binary division."""
     return float(Decimal(str(value)) / 100)
+
+
+def _price_per_share(description: Any) -> Optional[float]:
+    """Read the price of an insider description such as ``"Disposition at $20.05 per share"``.
+
+    Only the figure after the last ``at`` is a price: the first figure of the sentence
+    can be a number of shares (``"Sale of 1,018 shares at $20.05 per share"``).
+    """
+    if not description:
+        return None
+    text = " ".join(str(description).split())
+    _, separator, price_text = text.rpartition(" at ")
+    if not separator:
+        return None
+    return find_number(price_text)
 
 
 def _as_dict(payload: Any) -> Dict[str, Any]:
@@ -434,18 +450,28 @@ class FinancialsFormatter:
         elif hasattr(wsj, "dict"):
             wsj = wsj.dict()
 
-        if isinstance(wsj, dict) and "insider_transactions" in wsj:
+        if isinstance(wsj, dict) and isinstance(wsj.get("insider_transactions"), dict):
             wsj_insiders = wsj["insider_transactions"].get("Transactions", [])
             for i, item in enumerate(wsj_insiders):
-                txns[str(i)] = {
+                description = item.get("description")
+                raw_value = item.get("transactionAmount")
+                if raw_value is None and item.get("value") is not None:
+                    raw_value = parse_number(item.get("value"), decimal=".")
+                raw_price = item.get("transactionPrice")
+                if raw_price is None:
+                    raw_price = _price_per_share(description)
+                entry = {
                     "date": item.get("date"),
                     "ownerName": item.get("ownerName"),
                     "shares": item.get("shares"),
-                    "transactionCode": None,
-                    "transactionAmount": None,
-                    "transactionPrice": None,
-                    "description": item.get("description"),
+                    "transactionCode": item.get("transactionCode"),
+                    "transactionAmount": raw_value,
+                    "transactionPrice": raw_price,
+                    "description": description,
                 }
+                if item.get("ownerTitle"):
+                    entry["ownerTitle"] = item.get("ownerTitle")
+                txns[str(i)] = entry
 
         return txns
 
