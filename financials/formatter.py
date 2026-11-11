@@ -1,6 +1,7 @@
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,8 @@ class Field:
     scraped: Optional[str] = None
     # Yahoo publishes this key in percent (0.32 for 0.32 %): the document holds a ratio.
     yahoo_percent: bool = False
+    # The value is a label ("Hold", "buy"), not a number.
+    text: bool = False
 
 
 # Scraped providers whose price/earnings ratio, earnings per share and dividend
@@ -110,13 +113,39 @@ SPLITS_DIVIDENDS = {
 }
 
 ANALYST_RATINGS = {
-    "Rating": Field("consensus", "recommendationKey"),
+    # Barrons and Marketwatch display the consensus of the analysts as a label.
+    "Rating": Field("consensus", "recommendationKey", "rating", text=True),
     "TargetPrice": Field("target_mean", "targetMeanPrice"),
     "StrongBuy": Field("strong_buy"),
     "Buy": Field("buy"),
     "Hold": Field("hold"),
     "Sell": Field("sell"),
     "StrongSell": Field("strong_sell"),
+    "AnalystCount": Field(scraped="analyst_count"),
+    "Sentiment": Field(scraped="sentiment", text=True),
+}
+
+CURRENCY_SYMBOLS = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "CAD": "C$",
+    "AUD": "A$",
+    "CHF": "CHF",
+}
+
+COUNTRY_ISO = {
+    "United States": "US",
+    "France": "FR",
+    "Germany": "DE",
+    "United Kingdom": "GB",
+    "Canada": "CA",
+    "Japan": "JP",
+    "China": "CN",
+    "Switzerland": "CH",
+    "Netherlands": "NL",
+    "Ireland": "IE",
 }
 
 
@@ -151,6 +180,21 @@ def _price_per_share(description: Any) -> Optional[float]:
     if not separator:
         return None
     return find_number(price_text)
+
+
+def _looks_like_isin(value: Any) -> bool:
+    text = str(value or "").strip().upper()
+    return len(text) == 12 and text.isalnum() and text[:2].isalpha()
+
+
+def _utc_date(epoch_seconds: Any, fmt: str = "%Y-%m-%d") -> Optional[str]:
+    """Format a Unix time in seconds (Yahoo ``firstTradeDateEpochUtc``) as a UTC date."""
+    if not _is_number(epoch_seconds):
+        return None
+    try:
+        return datetime.fromtimestamp(float(epoch_seconds), tz=timezone.utc).strftime(fmt)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _as_dict(payload: Any) -> Dict[str, Any]:
@@ -196,15 +240,20 @@ class _Chooser:
             return stored[field.stored], stored_name
         if field.scraped:
             for provider in LIKE_FOR_LIKE_PROVIDERS:
-                value = self._scraped(provider, field.scraped)
+                value = self._scraped(provider, field.scraped, field.text)
                 if value is not None:
                     return value, provider
         return None, None
 
-    def _scraped(self, provider: str, field: str) -> Optional[float]:
+    def _scraped(self, provider: str, field: str, text: bool = False) -> Any:
         payload = _as_dict(self._results.get(provider))
         value = payload.get(field)
-        if payload.get("error") or not _is_number(value):
+        if payload.get("error"):
+            return None
+        if text:
+            label = value.strip() if isinstance(value, str) else ""
+            return label or None
+        if not _is_number(value):
             return None
         # Scraped pages display some fields in percent; the document holds ratios.
         return _percent_to_ratio(value) if field in percent_fields(provider) else value
@@ -262,7 +311,7 @@ class FinancialsFormatter:
 
         # Build the Premium answer
         rendered = {
-            "General": FinancialsFormatter._build_general(asset_profile, yf_info),
+            "General": FinancialsFormatter._build_general(asset_profile, yf_info, results),
             "Highlights": section_highlights,
             "Valuation": choose.section("Valuation", VALUATION, highlights),
             "SharesStats": choose.section("SharesStats", SHARES_STATS, highlights),
@@ -280,6 +329,7 @@ class FinancialsFormatter:
             "Financials": FinancialsFormatter._format_financials(
                 results.get("financial_statements")
             ),
+            "Competitors": FinancialsFormatter._build_competitors(results),
             "Providers": FinancialsFormatter._build_providers(results),
             # Which source gave each figure above ("database": stored figures).
             "Sources": choose.sources,
@@ -290,6 +340,18 @@ class FinancialsFormatter:
             rendered["ETF_Data"] = FinancialsFormatter._build_etf_data(results)
 
         return rendered
+
+    @staticmethod
+    def _build_competitors(results: Dict) -> Dict:
+        """Competitors listed by the scraped providers, numbered as EODHD lists do."""
+        competitors: Dict[str, Any] = {}
+        for provider in LIKE_FOR_LIKE_PROVIDERS:
+            payload = _as_dict(results.get(provider))
+            if payload.get("error"):
+                continue
+            for competitor in payload.get("competitors") or []:
+                competitors[str(len(competitors))] = _as_dict(competitor)
+        return competitors
 
     @staticmethod
     def _build_providers(results: Dict) -> Dict:
@@ -328,39 +390,80 @@ class FinancialsFormatter:
         return str(val)
 
     @staticmethod
-    def _build_general(profile: Dict, yf: Dict) -> Dict:
+    def _identity_sources(results: Dict) -> List[str]:
+        """Providers read for the identity of the instrument, the most reliable first.
+
+        The SEC gives the CIK it files under, then come the providers that publish the
+        same quantities as Yahoo, then the other providers called; the internal sections
+        of ``results`` (profile, stored figures) are not providers.
+        """
+        called = sorted(results.get("raw_providers") or {})
+        ordered = ["SECEdgar", *LIKE_FOR_LIKE_PROVIDERS, *called]
+        return list(dict.fromkeys(ordered))
+
+    @staticmethod
+    def _build_general(profile: Dict, yf: Dict, results: Optional[Dict] = None) -> Dict:
+        results = results or {}
+        isin = profile.get("isin") or yf.get("isin")
+        country = profile.get("country") or yf.get("country")
+        cik = yf.get("cik")
+
+        # What the instrument and Yahoo leave empty, the scraped providers may tell.
+        # A provider that found another instrument answered with an error (see the
+        # provider runner), so its ISIN is not read.
+        for name in FinancialsFormatter._identity_sources(results):
+            payload = _as_dict(results.get(name))
+            if not payload or payload.get("error"):
+                continue
+            if not isin and _looks_like_isin(payload.get("isin")):
+                isin = str(payload["isin"]).strip().upper()
+            if not country and payload.get("country"):
+                country = payload["country"]
+            if not cik and payload.get("cik"):
+                cik = payload["cik"]
+
         # Logo URL logic
         ticker = profile.get("ticker") or yf.get("symbol")
         logo_url = profile.get("logo_path")
         if not logo_url and ticker:
-            exchange = profile.get("exchange") or "UNKNOWN"
+            exchange = profile.get("exchange") or yf.get("exchange") or "UNKNOWN"
             clean_ticker = ticker.split(".")[0].upper()
             logo_url = f"/static/logos/{exchange}/{clean_ticker}.webp"
 
+        currency = profile.get("currency") or yf.get("currency")
+        country_iso = profile.get("country_code") or COUNTRY_ISO.get(country)
+
+        # Yahoo gives the first trade in seconds; some payloads carry milliseconds.
+        ipo_date = _utc_date(yf.get("firstTradeDateEpochUtc"))
+        if ipo_date is None and _is_number(yf.get("firstTradeDateMilliseconds")):
+            ipo_date = _utc_date(float(yf["firstTradeDateMilliseconds"]) / 1000)
+
+        fiscal_year_end = yf.get("fiscalYearEnd") or _utc_date(yf.get("lastFiscalYearEnd"), "%B")
+
         return {
             "Code": ticker,
-            "Type": profile.get("quote_type") or "Common Stock",
+            "Type": profile.get("quote_type") or yf.get("quoteType") or "Common Stock",
             "Name": profile.get("name") or yf.get("longName"),
-            "Exchange": profile.get("exchange"),
-            "CurrencyCode": profile.get("currency") or yf.get("currency"),
-            "CurrencySymbol": None,  # Non-essentiel
-            "CountryName": profile.get("country"),
-            "CountryISO": profile.get("country_code"),
+            "Exchange": profile.get("exchange") or yf.get("exchange") or yf.get("fullExchangeName"),
+            "CurrencyCode": currency,
+            "CurrencySymbol": CURRENCY_SYMBOLS.get(currency),
+            "CountryName": country,
+            "CountryISO": country_iso,
             "OpenFigi": None,
-            "ISIN": profile.get("isin") or yf.get("isin"),
+            "ISIN": isin,
             "LEI": None,
-            "PrimaryTicker": profile.get("ticker"),
-            "CIK": yf.get("cik"),
+            "PrimaryTicker": profile.get("ticker") or ticker,
+            "CIK": cik,
             "EmployerIdNumber": None,
-            "FiscalYearEnd": yf.get("fiscalYearEnd"),
-            "IPODate": FinancialsFormatter._safe_str(yf.get("firstTradeDateEpochUtc")),
+            "FiscalYearEnd": fiscal_year_end,
+            "IPODate": ipo_date,
             "Sector": profile.get("sector") or yf.get("sector"),
             "Industry": profile.get("industry") or yf.get("industry"),
             "GicSector": profile.get("gic_sector"),
             "GicGroup": profile.get("gic_group"),
             "GicIndustry": profile.get("gic_industry"),
             "GicSubIndustry": profile.get("gic_sub_industry"),
-            "Description": profile.get("long_business_summary"),
+            "Description": profile.get("long_business_summary") or yf.get("longBusinessSummary"),
             "Address": yf.get("address1"),
             "Phone": yf.get("phone"),
             "WebURL": yf.get("website"),

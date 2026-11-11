@@ -33,6 +33,12 @@ _BARRONS_URL_RE = re.compile(
 # endpoint answers 401 to a bot challenge too, which a new token does not cure.
 _SEARCH_TOKEN_REJECTED = frozenset({400})
 _DYLAN_TOKEN_REJECTED = frozenset({400, 401})
+_ANALYST_RATING_SCALE = ("Sell", "Under", "Hold", "Over", "Buy")
+# Labels of a value cell: the consensus of the analysts, not a credit or ESG rating.
+_ANALYST_RATING_LABEL_RE = re.compile(r"\banalysts?'?\s+ratings?\b", re.IGNORECASE)
+_SENTIMENT_LABEL_RE = re.compile(r"\bsentiment\b", re.IGNORECASE)
+_LABEL_MAX_LENGTH = 40
+_EMOTION_CLASS_RE = re.compile(r"\b(emotion-[A-Za-z0-9_-]+)\b")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -572,8 +578,71 @@ class BarronsProvider(BaseProvider):
         if high_52 is not None:
             metrics.week_52_high = high_52
 
+        rating, sentiment = self._parse_rating_sentiment(parser)
+        _put(metrics, "rating", rating)
+        _put(metrics, "sentiment", sentiment)
+
         self._parse_next_data(parser, metrics)
         return metrics
+
+    def _parse_rating_sentiment(
+        self, parser: HTMLParser
+    ) -> tuple[Optional[str], Optional[str]]:
+        rating: Optional[str] = None
+        sentiment: Optional[str] = None
+
+        # 1. Real Barron's "Average Score:" scale under Analyst Ratings
+        style_text = " ".join(s.text() for s in parser.css("style"))
+        for block in parser.css("[data-id='AnalystRatings_ScaleBlock']"):
+            span = block.css_first("[data-id='AnalystRatings_ScaleText']") or block.css_first(
+                "span"
+            )
+            svg = block.css_first("svg")
+            classes = " ".join(
+                filter(
+                    None,
+                    [
+                        block.attributes.get("class"),
+                        svg.attributes.get("class") if svg else None,
+                        span.attributes.get("class") if span else None,
+                    ],
+                )
+            )
+            is_active = (
+                block.attributes.get("data-active") == "true"
+                or (svg is not None and svg.attributes.get("data-active") == "true")
+                or "active" in classes.lower().split()
+                or any(
+                    f".{cls} +span{{font-weight:bold" in style_text
+                    or f".{cls}+span{{font-weight:bold" in style_text
+                    for cls in _EMOTION_CLASS_RE.findall(classes)
+                )
+            )
+            if span and is_active:
+                rating = _text(span.text(strip=True))
+                break
+
+        # 2. A value cell (".value", ".data") read under the label written before it
+        for label, value in _labelled_values(parser):
+            if rating and sentiment:
+                break
+            if not rating and _ANALYST_RATING_LABEL_RE.search(label):
+                rating = value
+            elif not sentiment and _SENTIMENT_LABEL_RE.search(label):
+                sentiment = value
+
+        # 3. Fallback on explicit rating/sentiment classes
+        if not rating:
+            rating_node = parser.css_first(".rating-value, [class*='RatingValue'], .analyst-rating")
+            if rating_node:
+                rating = _text(rating_node.text(strip=True))
+
+        if not sentiment:
+            sentiment_node = parser.css_first(".sentiment-value, [class*='SentimentValue']")
+            if sentiment_node:
+                sentiment = _text(sentiment_node.text(strip=True))
+
+        return rating, sentiment
 
     @classmethod
     def _parse_next_data(cls, parser: HTMLParser, metrics: FinancialMetrics) -> None:
@@ -634,6 +703,22 @@ class BarronsProvider(BaseProvider):
             _nested_number(vol_card, "averageVolumeForPeriod", "value"),
         )
 
+        analyst_card = props.get("analystRatingsBarCard") or {}
+        raw_rating = analyst_card.get("rating")
+        if (
+            isinstance(raw_rating, int)
+            and not isinstance(raw_rating, bool)
+            and 0 <= raw_rating < len(_ANALYST_RATING_SCALE)
+        ):
+            _put(metrics, "rating", _ANALYST_RATING_SCALE[raw_rating])
+        total_ratings = analyst_card.get("totalRatings")
+        if (
+            isinstance(total_ratings, int)
+            and not isinstance(total_ratings, bool)
+            and total_ratings > 0
+        ):
+            _put(metrics, "analyst_count", total_ratings)
+
     def _find_range_by_label(
         self, parser: HTMLParser, labels: list[str]
     ) -> tuple[Optional[float], Optional[float]]:
@@ -687,6 +772,28 @@ class BarronsProvider(BaseProvider):
                         if value is not None:
                             return value
         return None
+
+
+def _labelled_values(parser: HTMLParser) -> list[tuple[str, str]]:
+    """Each value cell of the page with the label written right before it."""
+    pairs = []
+    for value_node in parser.css(".value, .data"):
+        value = _text(value_node.text(strip=True))
+        label = _previous_label(value_node)
+        if value and label:
+            pairs.append((label, value))
+    return pairs
+
+
+def _previous_label(node: Any) -> Optional[str]:
+    """Text of the nearest element before ``node`` among its siblings, when short."""
+    sibling = node.prev
+    while sibling is not None:
+        text = sibling.text(strip=True)
+        if sibling.tag != "-text" or text:
+            return text if 0 < len(text) < _LABEL_MAX_LENGTH else None
+        sibling = sibling.prev
+    return None
 
 
 def _looks_like_isin(value: str) -> bool:

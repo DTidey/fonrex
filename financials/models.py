@@ -3,6 +3,18 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class Competitor(BaseModel):
+    """
+    Model for a competitor extracted from MarketWatch.
+    """
+    name: str = Field(..., description="Competitor Name")
+    ticker: Optional[str] = Field(
+        None, description="Competitor ticker symbol, when the page links to its quote"
+    )
+    change_percent: Optional[str] = Field(None, description="Change Percentage")
+    market_cap: Optional[str] = Field(None, description="Market Capitalization")
+
+
 class StandardFinancials(BaseModel):
     """
     Standard schema of the financial data.
@@ -40,20 +52,25 @@ class FinancialMetrics(StandardFinancials):
     pe_ratio: Optional[float] = Field(None, description="Price Earning Ratio")
     profit_margin: Optional[float] = Field(None, description="Net margin (%)")
     operating_margin: Optional[float] = Field(None, description="Operating margin (%)")
-    esg_score: Optional[str] = Field(None, description="Score ESG")
+    esg_score: Optional[str] = Field(None, description="ESG Score")
     risk_level: Optional[str] = Field(None, description="Risk level (ETF)")
     morningstar_rating: Optional[str] = Field(None, description="Morningstar rating")
     eligibility: Optional[list[str]] = Field(None, description="Eligibility (PEA, SRD, etc.)")
     # Gurufocus Scores
-    piotroski_score: Optional[int] = Field(None, description="Score Piotroski")
-    beneish_m_score: Optional[float] = Field(None, description="Score Beneish M")
+    piotroski_score: Optional[int] = Field(None, description="Piotroski Score")
+    beneish_m_score: Optional[float] = Field(None, description="Beneish M Score")
     altman_z_score: Optional[float] = Field(None, description="Altman Z-Score")
     roic: Optional[float] = Field(None, description="ROIC (%)")
-    gf_score: Optional[float] = Field(None, description="Score Gurufocus")
+    gf_score: Optional[float] = Field(None, description="Gurufocus Score")
     insider_transactions: Optional[dict] = Field(
         None, description="Insider transactions summary and recent filings"
     )
 
     # Metadata
-    provider_url: Optional[str] = Field(None, description="URL de la source")
-    ticker: Optional[str] = Field(None, description="Symbole boursier (Format Provider)")
+    provider_url: Optional[str] = Field(None, description="Source URL")
+    ticker: Optional[str] = Field(None, description="Stock ticker (Provider format)")
+
+    competitors: Optional[list[Competitor]] = Field(None, description="List of competitors")
+    rating: Optional[str] = Field(None, description="Analyst Rating")
+    analyst_count: Optional[int] = Field(None, description="Number of Analyst Ratings")
+    sentiment: Optional[str] = Field(None, description="Sentiment label")
