@@ -2,6 +2,7 @@
 target-version = "py312"
 line-length = 100
 extend-exclude = [
+    ".venv",
     "data",
     "node_modules",
     "scratch",
@@ -29,17 +30,35 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # These bootstrap files deliberately mutate sys.path before importing the app.
 "scripts/*.py" = ["E402"]
-"tests/debug_db_asset.py" = ["E402"]
 "tests/test_migrations.py" = ["E402"]
-"tests/verify_asset_mapping.py" = ["E402"]
 
 # `l` is the public low-price field in the compact OHLCV wire contract.
 "schemas/technical.py" = ["E741"]
+
+[tool.mypy]
+# `make typecheck` checks the typed boundaries (TYPED_BOUNDARIES in the Makefile)
+# in strict mode. The modules they import are read for their types without being
+# reported: a module is typed by adding it to TYPED_BOUNDARIES, never removed.
+python_version = "3.12"
+strict = true
+follow_imports = "silent"
+# The repository root holds an __init__.py: without these two settings mypy names
+# a module both `use_cases.errors` and `fonrex.use_cases.errors`. Modules are
+# named from the root, as the application imports them.
+mypy_path = "$MYPY_CONFIG_FILE_DIR"
+explicit_package_bases = true
+
+# Libraries without type information, read as untyped. pandas-stubs is not
+# installed yet: it would type the index labels of a DataFrame as Hashable.
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 branch = true
 source = ["."]
 omit = [
+    ".venv/*",
     "alembic/*",
     "data/*",
     "scratch/*",

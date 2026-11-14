@@ -116,22 +116,19 @@ class CacheEntriesAreDataTest(unittest.TestCase):
 
     def test_application_code_never_imports_pickle(self):
         import ast
-        from pathlib import Path
 
-        root = Path(__file__).resolve().parent.parent
+        from project_sources import relative, scope, syntax_tree
+
         offenders = []
-        for path in root.rglob("*.py"):
-            relative = path.relative_to(root)
-            if relative.parts[0] in {"tests", ".venv", "venv", "path", "node_modules"}:
-                continue
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        for path in scope("code"):
+            for node in ast.walk(syntax_tree(path)):
                 names = []
                 if isinstance(node, ast.Import):
                     names = [alias.name for alias in node.names]
                 elif isinstance(node, ast.ImportFrom):
                     names = [node.module or ""]
                 if any(name.split(".")[0] in {"pickle", "cPickle", "dill", "shelve"} for name in names):
-                    offenders.append(f"{relative}:{node.lineno}")
+                    offenders.append(f"{relative(path)}:{node.lineno}")
 
         self.assertEqual(offenders, [])
 

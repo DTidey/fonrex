@@ -69,7 +69,9 @@ class TestDeclaredFloors:
         for module, floor in gate.MODULE_THRESHOLDS.items():
             assert 0 < floor <= 100, module
 
-    def test_global_floor_is_read_from_pyproject_and_never_lowered(self):
+    def test_global_floor_is_read_from_pyproject(self):
+        # Neither this floor nor the module floors may go below those of main:
+        # tests/test_guard_ratchets.py compares them with origin/main.
         assert gate.global_floor() >= 70.0
 
     def test_global_floor_is_optional(self, tmp_path):
