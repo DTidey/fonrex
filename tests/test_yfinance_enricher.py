@@ -168,25 +168,24 @@ def _make_mock_ticker():
     )
     ticker.earnings_history = eh_data
 
-    # .analyst_price_targets (dict)
+    # .analyst_price_targets (dict): the keys of yfinance, "current" is the share price.
+    # The count of analysts is not there: it is info["numberOfAnalystOpinions"].
     ticker.analyst_price_targets = {
         "current": 162.0,
         "low": 130.0,
         "high": 195.0,
         "mean": 165.0,
-        "numberOfAnalystOpinions": 24,
+        "median": 168.0,
     }
+    ticker.info["numberOfAnalystOpinions"] = 24
 
-    # .recommendations
+    # .recommendations: one row per month, the current month (0m) first.
     recs_data = pd.DataFrame(
         [
-            {
-                "strongBuy": 8,
-                "buy": 10,
-                "hold": 5,
-                "sell": 1,
-                "strongSell": 0,
-            },
+            {"period": "0m", "strongBuy": 8, "buy": 10, "hold": 5, "sell": 1, "strongSell": 0},
+            {"period": "-1m", "strongBuy": 7, "buy": 9, "hold": 6, "sell": 1, "strongSell": 0},
+            {"period": "-2m", "strongBuy": 6, "buy": 9, "hold": 7, "sell": 2, "strongSell": 0},
+            {"period": "-3m", "strongBuy": 5, "buy": 6, "hold": 12, "sell": 2, "strongSell": 1},
         ]
     )
     ticker.recommendations = recs_data
@@ -539,41 +538,148 @@ class TestFetchRatings(_DatabaseTestCase):
         session.close()
         self.enricher = YFinanceEnricher(self.db_service)
 
+    def _stored_rating(self):
+        session = self.Session()
+        try:
+            return session.query(AnalystRatings).filter_by(asset_id=1).one()
+        finally:
+            session.close()
+
     def test_ratings_inserted(self):
         mock_ticker = _make_mock_ticker()
-        self.enricher._fetch_ratings(1, mock_ticker)
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
 
-        session = self.Session()
-        rating = session.query(AnalystRatings).filter_by(asset_id=1).first()
-        self.assertIsNotNone(rating)
-        self.assertEqual(float(rating.target_mean), 162.0)
-        self.assertEqual(float(rating.target_low), 130.0)
-        self.assertEqual(float(rating.target_high), 195.0)
+        rating = self._stored_rating()
+        # The targets, not the share price ("current" = 162.0).
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+        self.assertEqual(rating.target_median, Decimal("168.0"))
+        self.assertEqual(rating.target_low, Decimal("130.0"))
+        self.assertEqual(rating.target_high, Decimal("195.0"))
+        # From info: analyst_price_targets has no count.
         self.assertEqual(rating.nb_analysts, 24)
+        # The votes of the current month (0m), not of the last row (-3m).
         self.assertEqual(rating.strong_buy, 8)
         self.assertEqual(rating.buy, 10)
         self.assertEqual(rating.hold, 5)
         self.assertEqual(rating.sell, 1)
         self.assertEqual(rating.strong_sell, 0)
-        session.close()
 
     def test_ratings_consensus(self):
-        """The consensus is the majority vote."""
+        """The consensus is the majority vote of the current month."""
         mock_ticker = _make_mock_ticker()
-        self.enricher._fetch_ratings(1, mock_ticker)
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
 
-        session = self.Session()
-        rating = session.query(AnalystRatings).filter_by(asset_id=1).first()
-        # 10 buy > 8 strong buy > 5 hold
+        # 0m: 10 buy > 8 strong buy > 5 hold; the -3m row would give "Hold".
+        self.assertEqual(self._stored_rating().consensus, "Buy")
+
+    def test_votes_are_picked_by_period_whatever_the_order(self):
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.recommendations = mock_ticker.recommendations.iloc[::-1]
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual((rating.strong_buy, rating.buy, rating.hold), (8, 10, 5))
+
+    def test_without_period_the_first_row_is_the_current_month(self):
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.recommendations = mock_ticker.recommendations.drop(columns="period")
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual((rating.strong_buy, rating.buy, rating.hold), (8, 10, 5))
         self.assertEqual(rating.consensus, "Buy")
+
+    def test_an_older_month_is_not_stored_as_the_current_votes(self):
+        mock_ticker = _make_mock_ticker()
+        recs = mock_ticker.recommendations
+        mock_ticker.recommendations = recs[recs["period"] != "0m"]
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        # No -1m votes: the vote columns keep their default (0).
+        self.assertEqual((rating.strong_buy, rating.buy, rating.hold), (0, 0, 0))
+        self.assertIsNone(rating.consensus)
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+
+    def test_price_targets_as_a_dataframe(self):
+        """Some yfinance versions give the targets as a DataFrame."""
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.analyst_price_targets = pd.DataFrame(
+            [{"current": 152.48, "low": 160.0, "high": 200.0, "mean": 178.57, "median": 180.0}]
+        )
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual(rating.target_mean, Decimal("178.57"))
+        self.assertEqual(rating.target_median, Decimal("180.0"))
+        self.assertEqual(rating.target_low, Decimal("160.0"))
+        self.assertEqual(rating.target_high, Decimal("200.0"))
+        self.assertEqual(rating.nb_analysts, 24)
+
+    def test_a_zero_target_is_kept(self):
+        """A real 0.0 is stored, not replaced by another figure."""
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.analyst_price_targets = {
+            "current": 162.0,
+            "low": 0.0,
+            "high": 195.0,
+            "mean": 0.0,
+            "median": 0.0,
+        }
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual(rating.target_mean, Decimal("0"))
+        self.assertEqual(rating.target_median, Decimal("0"))
+        self.assertEqual(rating.target_low, Decimal("0"))
+
+    def test_a_missing_median_stays_empty(self):
+        mock_ticker = _make_mock_ticker()
+        del mock_ticker.analyst_price_targets["median"]
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertIsNone(rating.target_median)
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+
+    def test_info_without_a_count_of_analysts(self):
+        mock_ticker = _make_mock_ticker()
+        del mock_ticker.info["numberOfAnalystOpinions"]
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertIsNone(rating.nb_analysts)
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+
+    def test_a_second_fetch_rewrites_the_stored_ratings(self):
+        """Rows stored before the fix are rewritten on the next enrichment."""
+        session = self.Session()
+        session.add(
+            AnalystRatings(
+                asset_id=1,
+                target_mean=Decimal("162.0"),
+                target_median=Decimal("165.0"),
+                nb_analysts=None,
+                hold=12,
+            )
+        )
+        session.commit()
         session.close()
+        mock_ticker = _make_mock_ticker()
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+        self.assertEqual(rating.target_median, Decimal("168.0"))
+        self.assertEqual(rating.nb_analysts, 24)
+        self.assertEqual(rating.hold, 5)
 
     def test_ratings_no_data(self):
         """Must not crash without data."""
         mock_ticker = MagicMock()
         mock_ticker.analyst_price_targets = None
         mock_ticker.recommendations = None
-        self.enricher._fetch_ratings(1, mock_ticker)
+        self.enricher._fetch_ratings(1, mock_ticker, {})
 
         session = self.Session()
         count = session.query(AnalystRatings).filter_by(asset_id=1).count()
@@ -657,6 +763,8 @@ class TestEnrich(_DatabaseTestCase):
         self.assertEqual(session.query(FundamentalsHighlights).filter_by(asset_id=1).count(), 1)
         currencies = {row.currency for row in session.query(FinancialStatement)}
         self.assertEqual(currencies, {"EUR"})
+        rating = session.query(AnalystRatings).filter_by(asset_id=1).one()
+        self.assertEqual(rating.nb_analysts, 24)
         session.close()
         metadata = self.db_service.update_asset_profile_from_metadata.call_args.args[1]
         self.assertEqual(metadata["sector"], "Industrials")
@@ -805,15 +913,20 @@ class TestEnrich(_DatabaseTestCase):
                 "profile": "Yahoo returned no info",
                 "highlights": "Yahoo returned no info",
                 "statements_currency": "Yahoo returned no info",
+                "ratings_nb_analysts": "Yahoo returned no info",
             },
         )
         self.assertEqual(result["errors"], [])
         # The steps that do not need info still run.
         self.assertTrue(result["statements"])
         self.assertTrue(result["earnings"])
+        self.assertTrue(result["ratings"])
         session = self.Session()
         self.assertEqual(session.query(FundamentalsHighlights).filter_by(asset_id=1).count(), 0)
         self.assertGreater(session.query(FinancialStatement).filter_by(asset_id=1).count(), 0)
+        rating = session.query(AnalystRatings).filter_by(asset_id=1).one()
+        self.assertIsNone(rating.nb_analysts)
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
         session.close()
 
     def _enrich_with_sector_and_industry(self):

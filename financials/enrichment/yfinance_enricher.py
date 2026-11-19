@@ -110,6 +110,35 @@ def _safe_date(value):
 NO_INFO = "Yahoo returned no info"
 
 
+def _price_target_values(targets) -> dict:
+    """The stored price targets from Yahoo's ``analyst_price_targets`` (dict or row).
+
+    Yahoo gives ``current`` (the share price), ``low``, ``high``, ``mean`` and
+    ``median``. Each target is read from its own key, never ``a or b``: a real
+    ``0.0`` is kept, not replaced by another figure.
+    """
+    return {
+        "target_mean": _to_decimal(targets.get("mean")),
+        "target_median": _to_decimal(targets.get("median")),
+        "target_low": _to_decimal(targets.get("low")),
+        "target_high": _to_decimal(targets.get("high")),
+    }
+
+
+def _current_month_recommendations(recs: pd.DataFrame) -> pd.Series | None:
+    """The votes of the current month in Yahoo's ``recommendations``.
+
+    Yahoo gives one row per month, ``0m`` first, then ``-1m``, ``-2m``, ``-3m``:
+    the last row is three months old. The row is picked by its ``period``; without
+    that column, the first row is the current month. ``None`` when a ``period``
+    column has no ``0m`` row: an older month is not stored as the current votes.
+    """
+    if "period" not in recs.columns:
+        return recs.iloc[0]
+    current = recs[recs["period"] == "0m"]
+    return None if current.empty else current.iloc[0]
+
+
 class _StepSkipped(Exception):
     """Raised by a step that stored nothing on purpose: its reason goes to ``skipped``."""
 
@@ -211,7 +240,7 @@ class YFinanceEnricher:
             "highlights": (self._fetch_highlights, info),
             "statements": (self._fetch_statements, yf_ticker, info),
             "earnings": (self._fetch_earnings, yf_ticker),
-            "ratings": (self._fetch_ratings, yf_ticker),
+            "ratings": (self._fetch_ratings, yf_ticker, info),
             "esg": (self._fetch_esg, yf_ticker),
             "earnings_trend": (self._fetch_earnings_trend, yf_ticker),
             "shares_history": (self._fetch_outstanding_shares, yf_ticker),
@@ -223,6 +252,7 @@ class YFinanceEnricher:
                 "profile": NO_INFO,
                 "highlights": NO_INFO,
                 "statements_currency": NO_INFO,
+                "ratings_nb_analysts": NO_INFO,
             }
         operations = {name: step for name, step in steps.items() if name not in skipped}
 
@@ -659,8 +689,12 @@ class YFinanceEnricher:
     # Analyst Ratings
     # ------------------------------------------------------------------
 
-    def _fetch_ratings(self, asset_id: int, t: yf.Ticker) -> None:
-        """Read the analyst consensus and the price target."""
+    def _fetch_ratings(self, asset_id: int, t: yf.Ticker, info: dict) -> None:
+        """Read the analyst consensus, the price targets and the count of analysts.
+
+        ``info`` is Yahoo's info read once by ``enrich()``: it holds the count of
+        analysts (``numberOfAnalystOpinions``), left empty when info is.
+        """
         try:
             from models import AnalystRatings
 
@@ -676,34 +710,24 @@ class YFinanceEnricher:
             except Exception:
                 recs = None
 
-            # Read the price targets
+            # Read the price targets. Their "current" key is the share price, not a target.
             target_values = {}
             if targets is not None:
                 if isinstance(targets, dict):
-                    target_values = {
-                        "target_mean": _to_decimal(targets.get("current")),
-                        "target_low": _to_decimal(targets.get("low")),
-                        "target_high": _to_decimal(targets.get("high")),
-                        "target_median": _to_decimal(targets.get("mean") or targets.get("median")),
-                        "nb_analysts": _to_int(targets.get("numberOfAnalystOpinions")),
-                    }
+                    target_values = _price_target_values(targets)
                 elif isinstance(targets, pd.DataFrame) and not targets.empty:
                     # Some yfinance versions return a DataFrame
                     row = targets.iloc[-1] if len(targets) > 0 else None
                     if row is not None:
-                        target_values = {
-                            "target_mean": _to_decimal(row.get("current")),
-                            "target_low": _to_decimal(row.get("low")),
-                            "target_high": _to_decimal(row.get("high")),
-                            "target_median": _to_decimal(row.get("mean") or row.get("median")),
-                        }
+                        target_values = _price_target_values(row)
+            # The count of analysts is in info, not in the price targets.
+            nb_analysts = _to_int(info.get("numberOfAnalystOpinions"))
 
             # Read the recommendations (Strong Buy, Buy, Hold, Sell, Strong Sell)
             rec_values = {}
             consensus = None
             if recs is not None and isinstance(recs, pd.DataFrame) and not recs.empty:
-                # Take the latest row
-                latest = recs.iloc[-1] if len(recs) > 0 else None
+                latest = _current_month_recommendations(recs)
                 if latest is not None:
                     rec_values = {
                         "strong_buy": _to_int(latest.get("strongBuy")),
@@ -724,7 +748,7 @@ class YFinanceEnricher:
                     if any(v > 0 for v in votes.values()):
                         consensus = max(votes, key=votes.get)
 
-            if not target_values and not rec_values:
+            if not target_values and not rec_values and nb_analysts is None:
                 logger.debug("No ratings for asset_id=%s", asset_id)
                 return
 
@@ -732,6 +756,7 @@ class YFinanceEnricher:
                 "asset_id": asset_id,
                 "fetched_at": datetime.now(timezone.utc),
                 "consensus": consensus,
+                "nb_analysts": nb_analysts,
                 **target_values,
                 **rec_values,
             }
