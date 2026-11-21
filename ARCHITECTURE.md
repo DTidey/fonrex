@@ -149,7 +149,7 @@ At application startup, `main.py` initializes:
 - The OpenBB Workspace definitions (`integrations/openbb/widgets.json` and `apps.json`), read once.
 - All these objects are published in `app.state` and resolved by FastAPI dependencies; no mutable service is kept in a global module variable.
 
-The providers need no connection and are set up when `main.py` is imported: the classes of `PROVIDER_SPECS` are kept in a registry and instantiated by the runner for each request, the four providers of `SPECIALIZED_PROVIDER_SPECS` are instantiated once. A provider that cannot be imported is left out, and `GET /health` lists it under `providers.unavailable`. The start is tolerant: without an asynchronous database URL the realtime worker, the news service and the monitoring are not created; the worker, news, FRED, DCF and monitoring are each started on their own and leave an empty slot on failure. The routes that need a missing service answer `503`; the rest of the API starts.
+The providers need no connection and are set up when `main.py` is imported: the classes of `PROVIDER_SPECS` are kept in a registry and instantiated by the runner for each request, the providers of `SPECIALIZED_PROVIDER_SPECS` are instantiated once. A provider that cannot be imported is left out, and `GET /health` lists it under `providers.unavailable`. The start is tolerant: without an asynchronous database URL the realtime worker, the news service and the monitoring are not created; the worker, news, FRED, DCF and monitoring are each started on their own and leave an empty slot on failure. The routes that need a missing service answer `503`; the rest of the API starts.
 
 `main.py` never creates or modifies the schema. On startup, it checks the connection and then compares the stored revision in `alembic_version` with the expected head. An unmigrated or unreachable database is declared unavailable (`db_available = False`) and the routes that need it answer `503`; the Docker entrypoint applies `alembic upgrade head` beforehand.
 
@@ -176,6 +176,7 @@ How far each feature follows this split today:
 | Macro | `routers/macro.py` | `macro/fred_service.py`, `macro/ecb_service.py` | No — each service has its own HTTP client |
 | Commitments of Traders | `routers/cot.py` | `macro/cot_reports.py` | No — the router calls the service directly |
 | Factors | `routers/factors.py` | `factors/store.py`, `factors/french_library.py`, `factors/exposure.py` | No — the router calls the factor library directly |
+| Risk | `routers/risk.py` | `risk/service.py`, `risk/metrics.py`, `macro/risk_free_rates.py` | No — the router calls the service directly; the metrics are pure calculations |
 | Operations | `routers/admin.py` | `database/maintenance.py`, `cache/service.py` | No |
 | OpenBB | `routers/openbb.py` | calls the route functions of the other routers | — |
 
@@ -299,12 +300,17 @@ Detailed domain designs live in `docs/` (loaded on demand so this file stays foc
 | `macro/treasury_curves.py` | The daily yield curves of the US Treasury (par curve since 1990, real curve since 2003) kept day by day in `yield_curve_points` (asynchronous session): a year is read only when a request needs it, a past year read after its end is never read again, the current year is read again after `TREASURY_REFRESH_HOURS`; the curve of a day (or of the business day before) and the history of some maturities. |
 | `macro/cot_reports.py` | The Commitments of Traders reports of the CFTC (Legacy since 1986, TFF and Disaggregated since June 2006) kept week by week in `cot_weeks` and `cot_positions` (asynchronous session): a year is read only when a request needs it, the years up to 2016 come together from the history file of their report and are never read again, a later past year read from 15 January of the next year on is never read again, the current year is read again after `COT_REFRESH_HOURS`; the markets stored with their latest name, the lines of a market, and its signals (net position, share of the open interest, weekly change, COT index over a window of weeks, estimated day of publication). |
 | `macro/eurostat_service.py` | Indicators of Eurostat read in SDMX-CSV (HICP inflation and core inflation, unemployment rate, GDP growth, economic sentiment, consumer confidence), by country, kept period by period in `macro_observations` (asynchronous session); a refresh asks again for the last periods stored to take the revisions. |
+| `macro/short_rates.py` | The 3-month interest rates of the OECD, every country in one reading, kept month by month in `macro_observations` (source `oecd`, indicator `rate_3m`, `geo` the area of the OECD: `EA20`, `CHE`, `GBR`...) with a load per area in `macro_series_loads` (asynchronous session): the whole history from 1990 the first time, then the last 24 months again for the revisions, not before `OECD_REFRESH_HOURS`; a refusal keeps the stored rates, and the OECD is not asked again before `OECD_RETRY_MINUTES` (15 by default) unless forced. |
+| `macro/risk_free_rates.py` | The risk-free rate of each day in the currency of a listing, for Sharpe and Sortino: USD from the 3-month maturity of the Treasury par curve (a day takes the last rate within 7 days), other currencies from the OECD 3-month rate of their area (a day takes its month, or the last month within 3 months); a minor unit is read as its major one (`GBX` as `GBP`). A currency without source, or a day without rate within those bounds, gives no rate and the reason, never a fixed rate. |
 | `factors/french_library.py` | Catalogue of the Kenneth French Data Library datasets (US, Europe, developed markets; 3 factors, 5 factors, momentum; monthly and daily), download of a zipped file and parsing of its CSV into ratios. |
 | `factors/store.py` | Factor returns stored in `factor_returns` (asynchronous session): a file is stored whole, replacing the previous one, and not downloaded again before `FACTORS_REFRESH_DAYS`. |
 | `factors/exposure.py` | Factor exposure of a listing: daily closes of the listing (`adj_close`), converted in US dollars with the ECB rates, monthly or daily returns, alignment with the factors and ordinary least squares (numpy). |
+| `risk/service.py` | The risk of a listing: its daily closes read by `asset_listing_id` over the last years before the last close, all on one basis (the `adj_close` when every bar of the window has one, else the traded `close` and a warning), the risk-free rate of each day from `macro/risk_free_rates.py` in the currency of the listing, and the metrics of `risk/metrics.py`; without rate, a warning and no Sharpe or Sortino. |
+| `risk/metrics.py` | Risk metrics of the daily closes of a listing, without input or output (numpy): simple returns, annualized return and volatility, maximum drawdown with its peak, trough and recovery, historical and Gaussian VaR and CVaR, Calmar, and Sharpe and Sortino on the risk-free rate of the day of each return. Losses are negative ratios; a figure that cannot be measured is `None`. |
 | `factors/cost_of_equity.py` | Cost of equity from the Fama/French factors for the valuation: betas of the listing and long-run premia of the factors of its region. |
 | `scripts/load_factors.py` | Command line download of the factor files into the database. |
 | `scripts/load_fx_rates.py` | Command line download of the ECB reference rates of the euro into the database. |
+| `scripts/load_short_rates.py` | Command line download of the 3-month interest rates of the OECD into the database (every country, the whole history the first time). |
 | `scripts/load_treasury_curve.py` | Command line download of the daily yield curves of the US Treasury into the database (both curves, the whole history by default). |
 | `scripts/load_cot.py` | Command line download of the Commitments of Traders reports of the CFTC into the database (the three reports, the whole history by default). |
 | `scripts/load_esef.py` | Command line reading of the ESEF annual reports of the shares of the catalogue (every active share with an ISIN, funds left out, or the tickers given): the LEI asked to GLEIF, the filings never read read, one line per share; an error on one share is printed and the next shares are read; after 20 errors in a row (the database down) the reading stops. |
@@ -312,6 +318,7 @@ Detailed domain designs live in `docs/` (loaded on demand so this file stays foc
 | `schemas/macro.py` | Pydantic v2 schemas for the macro-economic rates and for the Eurostat indicators (latest values, series, refresh). |
 | `schemas/sec.py` | Pydantic v2 schemas of the SEC routes: statements as filed, the check against Yahoo, the refresh. |
 | `schemas/esef.py` | Pydantic v2 schemas of the ESEF routes: statements as filed with the link of their filing, the check against Yahoo, the filings of the index and their reading, the refresh. |
+| `schemas/risk.py` | Pydantic v2 schema of the risk route: the metrics as ratios, the drawdown with its dates, the risk-free rate used or why there is none. |
 | `schemas/factors.py` | Pydantic v2 schemas of the factor routes: datasets, what is stored of a file, series of factor returns. |
 | `monitoring/__init__.py` | Monitoring package exposing `ValidationLayer` and `CanaryMonitor`. |
 | `monitoring/models.py` | Pydantic-independent business models for canary results and statuses. |
@@ -327,6 +334,7 @@ Detailed domain designs live in `docs/` (loaded on demand so this file stays foc
 | `routers/cot.py` | HTTP routes of the Commitments of Traders reports of the CFTC: the markets stored, the positions of every type of trader in a market, the signals of one type of trader (net position, share of the open interest, change, COT index), the latest positioning of several markets, the most extreme first, refresh. |
 | `routers/sec.py` | HTTP routes of the annual statements filed with the SEC: statements, check against Yahoo, refresh; the instrument of the ticker, then its verified CIK. |
 | `routers/esef.py` | HTTP routes of the ESEF filings of European listed companies: statements, check against Yahoo, filings, refresh; the instrument of the ticker, then its verified LEI. |
+| `routers/risk.py` | HTTP route of the risk of a listing, its answer kept 6 hours in Redis under a key holding every parameter. |
 | `routers/factors.py` | HTTP routes of the factor returns: the datasets, the series of one dataset, the refresh of the files. |
 | `historical/providers.py` | yfinance and TradingView connectors for retrieving historical bars, and the choice between them (`fetch`): yfinance with the verified symbol, TradingView only for a line quoted in the currency of the listing. |
 | `historical/normalization.py` | Pure OHLCV validation, deduplication, and normalization rules. |
@@ -419,6 +427,7 @@ Every route of the application is listed here, and `tests/test_docs_consistency.
 | GET | `/factors/{dataset}` | Factor returns of one dataset (`frequency`, `start`, `end`), as ratios in US dollars; a file missing or older than `FACTORS_REFRESH_DAYS` is downloaded first |
 | POST | `/factors/refresh` | Download files of the library (`dataset`, `frequency`, `force`) |
 | GET | `/factors/exposure/{ticker}` | Exposure of a listing to the Fama/French factors (`model` ff3, ff5 or carhart; `frequency`, `window`, `end`, `region`): betas, alpha, R², on returns in US dollars |
+| GET | `/risk/{ticker}` | Risk of a listing over its last `years` of daily closes (1 to 10, 3 by default): annualized return and volatility, maximum drawdown, historical and Gaussian VaR and CVaR at `confidence` (0.95 by default), Calmar, Sharpe and Sortino on the 3-month rate of its currency, and the rate used or why there is none (`currency`, `exchange`, `isin` choose the listing; `force_refresh` measures again) |
 
 OpenBB Workspace routes (`routers/openbb.py`). Each one calls the route function of the Fonrex route it adapts, with the same parameters, and reshapes the answer (see [Integrations](docs/monitoring-and-integrations.md#integrations)):
 
@@ -477,6 +486,7 @@ What is cached, and for how long:
 | `GET /technical/screen` | `technical:screen:…` | 900 s (15 min) | `routers/technical.py` |
 | `GET /news/{ticker}` | `news:{ticker}:{limit}:{language}` | 1 800 s (30 min) | `NEWS_CACHE_TTL` |
 | `GET /dcf/*` | `dcf:{TICKER}:…` | 21 600 s (6 h) | `DCF_CACHE_TTL` |
+| `GET /risk/{ticker}` | `risk:{TICKER}:{years}y:{confidence}:{currency}:{exchange}:{isin}` | 21 600 s (6 h) | `RISK_CACHE_TTL` |
 | FRED series | `macro:fred:{series}` | 21 600 s (6 h) | `MACRO_RATES_CACHE_TTL` |
 | Last realtime quote | `quote:{ticker}` | 60 s | `REALTIME_QUOTE_TTL` |
 | Provider health summary | `provider:health:summary` | 3 600 s (1 h) | `monitoring/canary_monitor.py` |
@@ -485,8 +495,9 @@ What is cached, and for how long:
 
 Invalidation:
 
-- An ingestion drops the `history`, `eod`, `technical` and `dcf` entries of the ticker.
-- `POST /cache/clear` and `POST /cache/clear/{ticker}` delete `eod:*` entries only; `GET /cache/stats` counts the same entries. The other caches expire on their own, or are bypassed per request (`nocache` on `/fundamental`, `refresh` on `/fundamental/deep` and the specialised routes, `force_refresh` on `/news/{ticker}` and `/dcf/*`).
+- An ingestion drops the `history`, `eod`, `technical`, `dcf` and `risk` entries of the ticker.
+- `GET /risk/{ticker}` answers 503 when the startup refused the database (`db_available` false), and does not keep an answer without the risk-free rate of a currency that has a source (OECD or Treasury not answering, rates not loaded yet): the next request measures again.
+- `POST /cache/clear` and `POST /cache/clear/{ticker}` delete `eod:*` entries only; `GET /cache/stats` counts the same entries. The other caches expire on their own, or are bypassed per request (`nocache` on `/fundamental`, `refresh` on `/fundamental/deep` and the specialised routes, `force_refresh` on `/news/{ticker}`, `/dcf/*` and `/risk/{ticker}`).
 
 Application logs go to the standard output (`logging.basicConfig(level=INFO)`), read with `docker compose logs`.
 
@@ -539,7 +550,7 @@ Every file of `alembic/versions/` is listed here (`tests/test_docs_consistency.p
 | 019 | `019_yahoo_epoch_dates.py` | `fundamentals_highlights.dividend_ex_date` and `shares_short_date` equal to 1970-01-01 become NULL: Yahoo gives these dates in seconds since 1970 and the enrichment read them as nanoseconds. The enrichment now reads seconds (and also stores `dividend_pay_date` from `dividendDate`); the dates come back at the next refresh. The downgrade leaves the data alone. |
 | 020 | `020_factor_returns.py` | `factor_returns` (dataset, frequency, period end, factor → value as a ratio) and `factor_dataset_loads` (last download of each file of the Kenneth French library). The downgrade drops both tables. |
 | 021 | `021_fx_rates.py` | `fx_rates` (currency, day → units of the currency for one euro, ECB reference rate) and `fx_rate_loads` (last refresh of each currency). The downgrade drops both tables. |
-| 022 | `022_macro_observations.py` | `macro_observations` (source, indicator, geographic area, period → value, unit, flag of the source; Eurostat indicators, monthly or quarterly, a revision replacing the value of its period) and `macro_series_loads` (last refresh of each series). The downgrade drops both tables. |
+| 022 | `022_macro_observations.py` | `macro_observations` (source, indicator, geographic area, period → value, unit, flag of the source; Eurostat indicators, monthly or quarterly, and the monthly 3-month rates of the OECD, a revision replacing the value of its period) and `macro_series_loads` (last refresh of each series). The downgrade drops both tables. |
 | 023 | `023_xbrl_facts.py` | `xbrl_facts` (CIK, taxonomy, concept, unit, period end and length in days → value, the filing it was read from: accession, form, date filed) and `sec_company_loads` (last reading of each company from the SEC). The value of the latest filing is kept: a restatement replaces the earlier one. The downgrade drops both tables. |
 | 024 | `024_yield_curves.py` | `yield_curve_points` (source, curve, day, maturity → rate as a ratio, length of the maturity in months; the par curves of the US Treasury, nominal and real) and `yield_curve_loads` (last reading of each year of a curve). The downgrade drops both tables. |
 | 025 | `025_cot_reports.py` | `cot_weeks` (report, market code, report date → name of the market that week, contract units, open interest), `cot_positions` (long, short and spreading of each type of trader of a line, removed with their line) and `cot_loads` (last reading of each year of a report and the file that held it); the Commitments of Traders reports of the CFTC. The downgrade drops the three tables. |

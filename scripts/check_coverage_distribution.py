@@ -43,6 +43,10 @@ MODULE_THRESHOLDS = {
     "technical/indicator_service.py": 70.0,
     "use_cases/fundamentals.py": 75.0,
     "use_cases/specialized.py": 90.0,
+    # Risk metrics: pure calculations, every branch tested.
+    "risk/metrics.py": 100.0,
+    # Risk-free rate of each day by currency: the alignment rules, every branch tested.
+    "macro/risk_free_rates.py": 100.0,
     # Cross-cutting helpers: settings read from the environment, usage log.
     "settings.py": 95.0,
     "usage_recorder.py": 95.0,
@@ -68,6 +72,7 @@ MODULE_THRESHOLDS = {
     "financials/providers/openfigi.py": 90.0,
     "financials/providers/sec_edgar.py": 79.0,
     "financials/providers/treasury.py": 98.0,
+    "financials/providers/oecd.py": 100.0,
     "financials/providers/wallStreetJournal_provider.py": 94.0,
     "financials/providers/yfinance_provider.py": 81.0,
     "financials/providers/ZoneBourse_provider.py": 96.0,
