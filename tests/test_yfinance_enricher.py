@@ -596,10 +596,108 @@ class TestFetchRatings(_DatabaseTestCase):
         self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
 
         rating = self._stored_rating()
-        # No -1m votes: the vote columns keep their default (0).
-        self.assertEqual((rating.strong_buy, rating.buy, rating.hold), (0, 0, 0))
+        # No -1m votes, and no "0 votes" either: the votes are unknown (NULL).
+        self.assertEqual(self._votes(rating), (None,) * 5)
         self.assertIsNone(rating.consensus)
         self.assertEqual(rating.target_mean, Decimal("165.0"))
+
+    def _store_old_rating(self):
+        """A row of an earlier enrichment, every column filled."""
+        session = self.Session()
+        session.add(
+            AnalystRatings(
+                asset_id=1,
+                consensus="Hold",
+                target_mean=Decimal("100.0"),
+                target_median=Decimal("101.0"),
+                target_low=Decimal("90.0"),
+                target_high=Decimal("110.0"),
+                nb_analysts=30,
+                strong_buy=1,
+                buy=2,
+                hold=20,
+                sell=3,
+                strong_sell=4,
+            )
+        )
+        session.commit()
+        session.close()
+
+    @staticmethod
+    def _votes(rating):
+        return (rating.strong_buy, rating.buy, rating.hold, rating.sell, rating.strong_sell)
+
+    @staticmethod
+    def _targets(rating):
+        return (rating.target_mean, rating.target_median, rating.target_low, rating.target_high)
+
+    def test_a_refresh_without_current_month_clears_the_old_votes(self):
+        """No 0m row: the old votes are not left next to a NULL consensus."""
+        self._store_old_rating()
+        mock_ticker = _make_mock_ticker()
+        recs = mock_ticker.recommendations
+        mock_ticker.recommendations = recs[recs["period"] != "0m"]
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual(self._votes(rating), (None,) * 5)
+        self.assertIsNone(rating.consensus)
+        # The rest of the row is this fetch's.
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+        self.assertEqual(rating.nb_analysts, 24)
+
+    def test_a_refresh_without_price_targets_clears_the_old_targets(self):
+        self._store_old_rating()
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.analyst_price_targets = {}
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertEqual(self._targets(rating), (None,) * 4)
+        self.assertEqual(self._votes(rating), (8, 10, 5, 1, 0))
+        self.assertEqual(rating.nb_analysts, 24)
+
+    def test_a_refresh_with_empty_target_dataframe_clears_the_old_targets(self):
+        self._store_old_rating()
+        mock_ticker = _make_mock_ticker()
+        mock_ticker.analyst_price_targets = pd.DataFrame()
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        self.assertEqual(self._targets(self._stored_rating()), (None,) * 4)
+
+    def test_a_refresh_without_a_count_clears_the_old_count(self):
+        self._store_old_rating()
+        mock_ticker = _make_mock_ticker()
+        del mock_ticker.info["numberOfAnalystOpinions"]
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+
+        rating = self._stored_rating()
+        self.assertIsNone(rating.nb_analysts)
+        self.assertEqual(rating.target_mean, Decimal("165.0"))
+
+    def test_a_refresh_stores_the_same_row_as_an_insert(self):
+        """A row's content does not depend on whether it existed before."""
+        mock_ticker = _make_mock_ticker()
+        recs = mock_ticker.recommendations
+        mock_ticker.recommendations = recs[recs["period"] != "0m"]
+        mock_ticker.analyst_price_targets = {}
+        columns = [c.name for c in AnalystRatings.__table__.columns]
+        ignored = {"id", "fetched_at"}
+
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+        inserted = self._stored_rating()
+        session = self.Session()
+        session.query(AnalystRatings).delete()
+        session.commit()
+        session.close()
+        self._store_old_rating()
+        self.enricher._fetch_ratings(1, mock_ticker, mock_ticker.info)
+        refreshed = self._stored_rating()
+
+        for column in set(columns) - ignored:
+            self.assertEqual(getattr(refreshed, column), getattr(inserted, column), column)
+        self.assertEqual(self._votes(inserted), (None,) * 5)
+        self.assertEqual(self._targets(inserted), (None,) * 4)
 
     def test_price_targets_as_a_dataframe(self):
         """Some yfinance versions give the targets as a DataFrame."""

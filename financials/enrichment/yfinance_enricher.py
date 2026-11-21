@@ -125,6 +125,10 @@ def _price_target_values(targets) -> dict:
     }
 
 
+_TARGET_COLUMNS = ("target_mean", "target_median", "target_low", "target_high")
+_VOTE_COLUMNS = ("strong_buy", "buy", "hold", "sell", "strong_sell")
+
+
 def _current_month_recommendations(recs: pd.DataFrame) -> pd.Series | None:
     """The votes of the current month in Yahoo's ``recommendations``.
 
@@ -696,6 +700,8 @@ class YFinanceEnricher:
         analysts (``numberOfAnalystOpinions``), left empty when info is.
         """
         try:
+            from sqlalchemy import null
+
             from models import AnalystRatings
 
             # Price targets
@@ -709,6 +715,13 @@ class YFinanceEnricher:
                 recs = t.recommendations
             except Exception:
                 recs = None
+
+            # Every column is written with what this fetch gives, NULL when it gives
+            # nothing: a refreshed row never keeps a figure of an earlier fetch, and it
+            # holds the same as a row created by this fetch (the vote columns' model
+            # default 0 would read as real "0 votes" in /fundamental).
+            empty_targets = dict.fromkeys(_TARGET_COLUMNS)
+            empty_votes = dict.fromkeys(_VOTE_COLUMNS)
 
             # Read the price targets. Their "current" key is the share price, not a target.
             target_values = {}
@@ -757,7 +770,9 @@ class YFinanceEnricher:
                 "fetched_at": datetime.now(timezone.utc),
                 "consensus": consensus,
                 "nb_analysts": nb_analysts,
+                **empty_targets,
                 **target_values,
+                **empty_votes,
                 **rec_values,
             }
 
@@ -770,7 +785,11 @@ class YFinanceEnricher:
                         if key != "asset_id":
                             setattr(existing, key, value)
                 else:
-                    obj = AnalystRatings(**values)
+                    # null(), not None: on an INSERT the ORM replaces None by the
+                    # column's default (0 votes), and the update path stores NULL.
+                    obj = AnalystRatings(
+                        **{key: null() if value is None else value for key, value in values.items()}
+                    )
                     session.add(obj)
 
                 session.commit()
