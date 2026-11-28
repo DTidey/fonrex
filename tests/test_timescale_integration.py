@@ -2085,7 +2085,8 @@ class TestTreasuryScriptOnPostgres:
 
 
 class TestShortRatesOnPostgres:
-    """The 3-month rates of the OECD in ``macro_observations`` and ``macro_series_loads``."""
+    """The 3-month and 10-year rates of the OECD in ``macro_observations`` and
+    ``macro_series_loads``."""
 
     FIXTURE = Path(__file__).parent / "fixtures" / "oecd" / "ir3tib_monthly.csv"
     NOW = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
@@ -2272,6 +2273,112 @@ class TestShortRatesOnPostgres:
             date(2026, 10, 1),
         )
 
+    async def test_the_10_year_rates_apart_from_the_3_month_rates(self, rates, engine):
+        """Same source, same areas, another indicator: neither series sees the other."""
+        from financials.providers.oecd import LONG_RATE, parse_rates_csv
+        from macro.short_rates import OECD_LONG_SERIES, ShortRates
+
+        short, _, _ = rates
+        long_answer = parse_rates_csv(
+            (self.FIXTURE.parent / "irlt_monthly.csv").read_bytes().decode(), LONG_RATE
+        )
+        long = ShortRates(
+            short.session_factory,
+            AsyncMock(return_value=long_answer),
+            now=lambda: self.NOW,
+            series=OECD_LONG_SERIES,
+        )
+
+        assert (await short.refresh()).status == "fetched"
+        load = await long.refresh()
+
+        assert (load.status, load.received) == ("fetched", 31)
+        assert load.areas == ["CHE", "CHN", "DEU", "EA20", "GBR", "JPN", "SWE", "USA"]
+        # GBR: the 3-month rate stops in 2026-02, the 10-year rate goes on.
+        assert [period for period, _ in await short.series("GBR")] == [
+            date(2025, 12, 1),
+            date(2026, 1, 1),
+            date(2026, 2, 1),
+        ]
+        assert await long.series("GBR", start=date(2026, 9, 1)) == [
+            (date(2026, 9, 1), Decimal("0.05242100")),
+            (date(2026, 10, 1), Decimal("0.05339300")),
+        ]
+        stored = {area.area: area for area in await long.stored_areas()}
+        assert (stored["CHN"].first_period, stored["CHN"].last_period) == (
+            date(2026, 7, 1),
+            date(2026, 9, 1),
+        )
+        assert "DNK" not in stored and "DEU" not in {a.area for a in await short.stored_areas()}
+        # A reading of one series does not make the other fresh.
+        assert await long.last_reading() == self.NOW
+        with engine.connect() as connection:
+            counts = dict(
+                connection.execute(
+                    text(
+                        "SELECT indicator, count(*) FROM macro_observations "
+                        "WHERE source = 'oecd' GROUP BY indicator"
+                    )
+                ).all()
+            )
+        assert counts == {"rate_3m": 30, "rate_10y": 31}
+
+
+class TestDiscountRateOfTheOecdOnPostgres:
+    """The risk-free rate of a DCF in francs, from the 10-year rates of the OECD stored."""
+
+    NOW = datetime(2026, 11, 25, 21, 0, tzinfo=timezone.utc)
+
+    async def test_a_swiss_valuation_takes_the_stored_swiss_rate(self, database_url, engine):
+        from financials.providers.oecd import LONG_RATE, parse_rates_csv
+        from macro.long_rates import LongRateRepository
+        from macro.short_rates import OECD_LONG_SERIES, ShortRates
+        from valuation.dcf_service import DCFService
+
+        class OnTheDayOfTheFixture(LongRateRepository):
+            """The fixture ends in 2026-10: the day is fixed, not the day of the run."""
+
+            async def latest(self, currency, *, today):
+                day = TestDiscountRateOfTheOecdOnPostgres.NOW.date()
+                return await super().latest(currency, today=day)
+
+        answer = parse_rates_csv(
+            (TestShortRatesOnPostgres.FIXTURE.parent / "irlt_monthly.csv").read_bytes().decode(),
+            LONG_RATE,
+        )
+        reader = AsyncMock(return_value=answer)
+        TestShortRatesOnPostgres.clean(engine)
+        async_engine = create_async_engine(
+            database_url.replace("postgresql://", "postgresql+asyncpg://", 1), poolclass=NullPool
+        )
+        long_rates = ShortRates(
+            async_sessionmaker(async_engine),
+            reader,
+            now=lambda: self.NOW,
+            series=OECD_LONG_SERIES,
+        )
+        service = DCFService(MagicMock(), long_rates=OnTheDayOfTheFixture(long_rates))
+        try:
+            first = await service._risk_free_rate("CHF")
+            again = await service._risk_free_rate("CHF")
+            pound = await service._risk_free_rate("GBX")
+            dollar = await service._risk_free_rate("USD")
+        finally:
+            await async_engine.dispose()
+            TestShortRatesOnPostgres.clean(engine)
+
+        # One reading of the OECD, then the stored rates.
+        assert reader.await_count == 1
+        assert (first.value, first.source, first.observation_date) == (
+            Decimal("0.00510000"),
+            "oecd_live",
+            date(2026, 10, 1),
+        )
+        assert (again.source, again.value) == ("oecd_cached", first.value)
+        assert (pound.source, pound.value) == ("oecd_cached", Decimal("0.05339300"))
+        # No FRED in this service: the dollar takes the US rate of the OECD.
+        assert (dollar.source, dollar.value) == ("oecd_cached", Decimal("0.05130000"))
+
 
 class TestShortRatesScriptOnPostgres:
     """``scripts/load_short_rates.py`` from the answers of the OECD and of the Bank of
@@ -2288,6 +2395,10 @@ class TestShortRatesScriptOnPostgres:
         answer = (fixtures / "oecd" / "ir3tib_monthly.csv").read_bytes()
         fake_network.get(
             "DSD_STES@DF_FINMARK,4.0/.M.IR3TIB.", httpx.Response(200, text=answer.decode())
+        )
+        long_answer = (fixtures / "oecd" / "irlt_monthly.csv").read_bytes()
+        fake_network.get(
+            "DSD_STES@DF_FINMARK,4.0/.M.IRLT.", httpx.Response(200, text=long_answer.decode())
         )
         sonia = (fixtures / "boe" / "sonia_monthly.csv").read_bytes()
         fake_network.get("_iadb-fromshowcolumns.asp", httpx.Response(200, text=sonia.decode()))
@@ -2312,6 +2423,14 @@ class TestShortRatesScriptOnPostgres:
             "  DNK    2026-07 → 2026-10",
         ]
         assert "  GBR    2025-12 → 2026-02" in lines
+        ten_years = lines.index("OECD, 10-year rates")
+        assert lines[ten_years : ten_years + 4] == [
+            "OECD, 10-year rates",
+            "fetched  31 rates of 8 areas from 1990-01",
+            "  CHE    2026-07 → 2026-10",
+            "  CHN    2026-07 → 2026-09",
+        ]
+        assert "  GBR    2026-07 → 2026-10" in lines[ten_years:]
         # The SONIA is stored under the same area, apart from the OECD rates (source boe).
         assert lines[-3:] == [
             "Bank of England, SONIA",
@@ -2319,11 +2438,14 @@ class TestShortRatesScriptOnPostgres:
             "  GBR    1997-01 → 2026-10",
         ]
         assert "startPeriod=1990-01" in fake_network.urls()[0]
-        assert "Datefrom=01%2FJan%2F1990" in fake_network.urls()[1]
+        assert "startPeriod=1990-01" in fake_network.urls()[1]
+        assert "Datefrom=01%2FJan%2F1990" in fake_network.urls()[2]
         assert fake_network.calls("IR3TIB") == 1
+        assert fake_network.calls("IRLT") == 1
         assert fake_network.calls("_iadb-fromshowcolumns.asp") == 1
         second_lines = second_output.splitlines()
         assert (second_lines[1], second_lines[-2]) == ("fresh   ", "fresh   ")
+        assert second_lines[second_lines.index("OECD, 10-year rates") + 1] == "fresh   "
 
 
 class TestRiskFreeRatesOnPostgres:
